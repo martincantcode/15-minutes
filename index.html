@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 minutes. For whom?</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚶</text></svg>">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;800&display=swap" rel="stylesheet">
+<style>
+  :root { --ink:#15171a; --paper:#f7f4ec; --teal:#1f7a99; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; font-family: Archivo, system-ui, sans-serif; color: var(--ink); }
+  body { display: flex; }
+  #panel { width: 360px; padding: 20px; background: var(--paper); overflow-y: auto; font-size: 14px; z-index: 2; }
+  h1 { font-weight: 800; font-size: 32px; line-height: 1; margin: 0 0 6px; }
+  h1 span { color: var(--teal); }
+  .ctl { margin: 14px 0; }
+  .ctl input[type=range] { width: 100%; }
+  .note { font-size: 12px; line-height: 1.4; color: #555; }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  td { padding: 3px 0; border-bottom: 1px solid #ddd; }
+  td:not(:first-child) { text-align: right; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  .dot.st { width: 12px; height: 12px; border: 2px solid #15171a; vertical-align: -2px; }
+  #legend { height: 10px; border-radius: 5px; margin: 6px 0 2px; }
+  #legendLabels { display: flex; justify-content: space-between; font-size: 12px; }
+  button { font: inherit; padding: 6px 10px; cursor: pointer; }
+  #status { min-height: 2.6em; margin-top: 8px; font-size: 13px; }
+  #status.err { color: #b3261e; }
+  #map { flex: 1; }
+  @media (max-width: 700px) { body { flex-direction: column-reverse; } #panel { width: 100%; height: 55%; } }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>15 minutes.<br><span>For whom?</span></h1>
+  <div class="note">Click the map or drag the marker. Coloured streets are what you can reach with your settings, coloured by walking time. Grey streets are reachable at 1.4 m/s with stairs allowed, but not with your settings.</div>
+
+  <div class="ctl"><label>Time budget: <b id="minOut">15</b> min
+    <input type="range" id="minutes" min="5" max="30" value="15"></label></div>
+
+  <div class="ctl"><label>Walking speed: <b id="spdOut"></b>
+    <input type="range" id="speed" min="0.8" max="1.8" step="0.05" value="1.4"></label>
+    <div class="note">Range 0.8–1.8 m/s from the meta-study by Giannoulaki &amp; Christoforou.</div></div>
+
+  <div class="ctl"><label><input type="checkbox" id="steps"> Avoid stairs (step-free)</label></div>
+
+  <div class="ctl">
+    <div id="legend"></div>
+    <div id="legendLabels"><span>0 min</span><span id="legendEnd"></span></div>
+  </div>
+
+  <div class="ctl"><button id="copyLink" type="button">Copy link to this view</button> <span class="note" id="copyMsg"></span></div>
+
+  <div class="ctl"><label><input type="checkbox" id="showAm" checked> Show amenities</label><br>
+    <label><input type="checkbox" id="showSt" checked> Show stations within reach</label><br>
+    <label><input type="checkbox" id="showBn"> Show benches</label></div>
+
+  <div id="stats"></div>
+  <div id="status">Loading street network…</div>
+  <div class="note">Not included: public transport travel, slope, lighting. Street, amenity and station data come from OpenStreetMap and are incomplete in places. Stations count as step-free only if OSM tags them wheelchair=yes.</div>
+</div>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+
+<!-- ============ CORE: no browser or Leaflet dependencies, so it can be tested in Node ============ -->
+<script id="core">
+const R_LAT = 110540, R_LON = 111320;   // metres per degree (equirectangular, fine at city scale)
+
+// graph.bin layout: see export_city.py
+function parseGraph(buf) {
+  const h = new Uint32Array(buf, 0, 4);
+  if (h[0] !== 1) throw new Error("Unsupported graph file version");
+  const nN = h[1], nE = h[2], nS = h[3];
+  let off = 16;
+  const ll = new Int32Array(buf, off, 2 * nN); off += 8 * nN;
+  const eu = new Uint32Array(buf, off, nE); off += 4 * nE;
+  const ev = new Uint32Array(buf, off, nE); off += 4 * nE;
+  const elf = new Uint32Array(buf, off, nE); off += 4 * nE;
+  const sst = new Uint32Array(buf, off, nE + 1); off += 4 * (nE + 1);
+  const sp = new Int32Array(buf, off, 2 * nS);
+
+  const merc = (lon, lat) => [lon / 360 + 0.5, 0.5 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / (2 * Math.PI)];
+  const lon = new Float64Array(nN), lat = new Float64Array(nN), mx = new Float64Array(nN), my = new Float64Array(nN);
+  for (let i = 0; i < nN; i++) {
+    lon[i] = ll[2 * i] / 1e5; lat[i] = ll[2 * i + 1] / 1e5;
+    [mx[i], my[i]] = merc(lon[i], lat[i]);
+  }
+  const smx = new Float64Array(nS), smy = new Float64Array(nS);
+  for (let i = 0; i < nS; i++) [smx[i], smy[i]] = merc(sp[2 * i] / 1e5, sp[2 * i + 1] / 1e5);
+
+  const elen = new Float32Array(nE), eflag = new Uint8Array(nE);
+  const deg = new Uint32Array(nN + 1);
+  for (let e = 0; e < nE; e++) {
+    elen[e] = (elf[e] >>> 2) / 10;
+    eflag[e] = elf[e] & 3;
+    deg[eu[e]]++; deg[ev[e]]++;
+  }
+  const adjStart = new Uint32Array(nN + 1);
+  for (let i = 0; i < nN; i++) adjStart[i + 1] = adjStart[i] + deg[i];
+  const fill = adjStart.slice(0, nN), adjEdge = new Uint32Array(2 * nE);
+  for (let e = 0; e < nE; e++) { adjEdge[fill[eu[e]]++] = e; adjEdge[fill[ev[e]]++] = e; }
+  return { nN, nE, lon, lat, mx, my, eu, ev, elen, eflag, sst, smx, smy, adjStart, adjEdge };
+}
+
+function buildGrid(g) {
+  const cellLat = 0.001, cellLon = 0.0015;
+  let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
+  for (let i = 0; i < g.nN; i++) {
+    if (g.lon[i] < minLon) minLon = g.lon[i]; if (g.lon[i] > maxLon) maxLon = g.lon[i];
+    if (g.lat[i] < minLat) minLat = g.lat[i]; if (g.lat[i] > maxLat) maxLat = g.lat[i];
+  }
+  const W = Math.floor((maxLon - minLon) / cellLon) + 1, H = Math.floor((maxLat - minLat) / cellLat) + 1;
+  const head = new Int32Array(W * H).fill(-1), next = new Int32Array(g.nN);
+  for (let i = 0; i < g.nN; i++) {
+    const c = Math.floor((g.lat[i] - minLat) / cellLat) * W + Math.floor((g.lon[i] - minLon) / cellLon);
+    next[i] = head[c]; head[c] = i;
+  }
+  return { minLon, minLat, cellLon, cellLat, W, H, head, next };
+}
+
+// nearest street node to a point; { node: -1 } if nothing within about maxRing cells
+function nearestNode(g, grid, lon, lat, maxRing = 8) {
+  const cx = Math.floor((lon - grid.minLon) / grid.cellLon), cy = Math.floor((lat - grid.minLat) / grid.cellLat);
+  const cosL = Math.cos(lat * Math.PI / 180);
+  const minCell = Math.min(grid.cellLat * R_LAT, grid.cellLon * cosL * R_LON);
+  let best = -1, bestD = Infinity;
+  for (let r = 0; r <= maxRing; r++) {
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+      const x = cx + dx, y = cy + dy;
+      if (x < 0 || y < 0 || x >= grid.W || y >= grid.H) continue;
+      for (let i = grid.head[y * grid.W + x]; i !== -1; i = grid.next[i]) {
+        const d = Math.hypot((g.lon[i] - lon) * cosL * R_LON, (g.lat[i] - lat) * R_LAT);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+    }
+    if (best !== -1 && bestD <= r * minCell) break;
+  }
+  return { node: best, dist: bestD };
+}
+
+// Dijkstra over walking time; stops at T seconds. Speed in m/s. Returns seconds per node (Infinity = not reached).
+function dijkstra(g, src, startSeconds, speed, avoidSteps, T) {
+  const dist = new Float64Array(g.nN).fill(Infinity);
+  const ht = [], hn = [];
+  const push = (t, n) => {
+    let i = ht.length; ht.push(t); hn.push(n);
+    while (i > 0) { const p = (i - 1) >> 1; if (ht[p] <= t) break; ht[i] = ht[p]; hn[i] = hn[p]; i = p; }
+    ht[i] = t; hn[i] = n;
+  };
+  const pop = () => {
+    const lt = ht.pop(), ln = hn.pop(), L = ht.length;
+    if (L === 0) return;
+    let i = 0;
+    while (true) {
+      let c = 2 * i + 1; if (c >= L) break;
+      if (c + 1 < L && ht[c + 1] < ht[c]) c++;
+      if (ht[c] >= lt) break;
+      ht[i] = ht[c]; hn[i] = hn[c]; i = c;
+    }
+    ht[i] = lt; hn[i] = ln;
+  };
+  dist[src] = startSeconds; push(startSeconds, src);
+  while (ht.length) {
+    const t = ht[0], n = hn[0]; pop();
+    if (t > dist[n]) continue;
+    if (t > T) break;
+    for (let k = g.adjStart[n]; k < g.adjStart[n + 1]; k++) {
+      const e = g.adjEdge[k];
+      if (avoidSteps && (g.eflag[e] & 1)) continue;
+      const m = g.eu[e] === n ? g.ev[e] : g.eu[e];
+      const nt = t + g.elen[e] / speed;
+      if (nt < dist[m]) { dist[m] = nt; push(nt, m); }
+    }
+  }
+  return dist;
+}
+
+// the edge as a flat [x0, y0, x1, y1, ...] path in mercator units, running from its low node to its high node (or reversed)
+function edgePath(g, e, reverse) {
+  const u = g.eu[e], v = g.ev[e], pts = [g.mx[u], g.my[u]];
+  for (let s = g.sst[e]; s < g.sst[e + 1]; s++) pts.push(g.smx[s], g.smy[s]);
+  pts.push(g.mx[v], g.my[v]);
+  if (!reverse) return pts;
+  const out = [];
+  for (let i = pts.length - 2; i >= 0; i -= 2) out.push(pts[i], pts[i + 1]);
+  return out;
+}
+
+// the first `frac` (0..1) of a path's length
+function cutPath(pts, frac) {
+  if (frac >= 1) return pts;
+  let total = 0;
+  for (let i = 2; i < pts.length; i += 2) total += Math.hypot(pts[i] - pts[i - 2], pts[i + 1] - pts[i - 1]);
+  let left = frac * total;
+  const out = [pts[0], pts[1]];
+  for (let i = 2; i < pts.length; i += 2) {
+    const seg = Math.hypot(pts[i] - pts[i - 2], pts[i + 1] - pts[i - 1]);
+    if (seg >= left) {
+      const f = seg > 0 ? left / seg : 0;
+      out.push(pts[i - 2] + (pts[i] - pts[i - 2]) * f, pts[i - 1] + (pts[i + 1] - pts[i - 1]) * f);
+      return out;
+    }
+    left -= seg; out.push(pts[i], pts[i + 1]);
+  }
+  return out;
+}
+
+// every edge that is at least partly reachable: { e, fromLow, frac (share of the edge reached), tt (0..1 walking time) }
+function collectReach(g, dist, T, speed, avoidSteps) {
+  const items = [];
+  let lengthM = 0;
+  for (let e = 0; e < g.nE; e++) {
+    if (avoidSteps && (g.eflag[e] & 1)) continue;
+    const du = dist[g.eu[e]], dv = dist[g.ev[e]];
+    const fromLow = du <= dv, a = fromLow ? du : dv, b = fromLow ? dv : du;
+    if (a > T) continue;
+    let frac = 1, tt;
+    if (b <= T) tt = b / T;
+    else { frac = Math.min(1, (T - a) / (g.elen[e] / speed)); tt = 1; }
+    items.push({ e, fromLow, frac, tt });
+    lengthM += g.elen[e] * frac;
+  }
+  return { items, lengthM };
+}
+
+// for each point of interest: nearest street node and straight-line distance to it
+function snapPois(g, grid, pts) {
+  const node = new Int32Array(pts.length), snap = new Float32Array(pts.length);
+  for (let i = 0; i < pts.length; i++) {
+    const r = nearestNode(g, grid, pts[i][0], pts[i][1], 6);
+    node[i] = r.node; snap[i] = r.node < 0 ? Infinity : r.dist;
+  }
+  return { node, snap };
+}
+</script>
+
+<!-- ============ APP ============ -->
+<script>
+const MAPTILER_KEY = "GCu4G3vyHD9T5M6LgLzW";   // restrict this key to your site's address in your MapTiler account
+const DATA_DIR = "data/cologne/";
+const REF_SPEED = 1.4;                        // reference walking speed, m/s (the slider default)
+const CAT_COLORS = ["#5b9a3c", "#d9534f", "#7b5ea7", "#2e8b57", "#e8a13a", "#8a5a2b", "#15171a"];
+// station dots by OSM wheelchair tag: 0 not tagged, 1 yes, 2 limited, 3 no
+const STATION_COLORS = ["#aaaaaa", "#2e8b57", "#e8a13a", "#555555"];
+const PALETTE = ["#0b4f6c", "#1f9e9a", "#9bc53d", "#f2c14e", "#e8743b"];   // walking time, near to far
+
+const $ = id => document.getElementById(id);
+const statusEl = $("status");
+
+// ---------- map ----------
+const map = L.map("map", { zoomControl: true }).setView([50.9413, 6.9583], 14);
+if (MAPTILER_KEY) {
+  L.tileLayer(`https://api.maptiler.com/maps/dataviz-light/256/{z}/{x}/{y}.png?key=${MAPTILER_KEY}`, {
+    maxZoom: 19, attribution: "&copy; MapTiler &copy; OpenStreetMap contributors"
+  }).addTo(map);
+} else {
+  L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", {
+    subdomains: "abc", maxZoom: 17, attribution: "Map data &copy; OpenStreetMap contributors | Style &copy; OpenTopoMap"
+  }).addTo(map);
+}
+const canvas = document.createElement("canvas");
+canvas.className = "leaflet-zoom-hide";
+canvas.style.cssText = "position:absolute;pointer-events:none";
+map.getPanes().overlayPane.appendChild(canvas);
+
+let G = null, grid = null, POIS = null, poiMx = null, poiMy = null, poiSnap = null;
+let origin = L.latLng(50.9413, 6.9583), state = null, queued = false;
+const marker = L.marker(origin, { draggable: true }).addTo(map);
+
+// ---------- helpers ----------
+function mix(c1, c2, f) {
+  const a = parseInt(c1.slice(1), 16), b = parseInt(c2.slice(1), 16), ch = s => (a >> s & 255) + ((b >> s & 255) - (a >> s & 255)) * f;
+  return `rgb(${ch(16) | 0},${ch(8) | 0},${ch(0) | 0})`;
+}
+function colorAt(t) {
+  const x = Math.min(0.9999, Math.max(0, t)) * (PALETTE.length - 1), i = Math.floor(x);
+  return mix(PALETTE[i], PALETTE[i + 1], x - i);
+}
+const NB = 12, BIN_COLORS = Array.from({ length: NB }, (_, i) => colorAt((i + 0.5) / NB));
+$("legend").style.background = `linear-gradient(to right, ${Array.from({ length: 11 }, (_, i) => colorAt(i / 10)).join(",")})`;
+
+function labels() {
+  $("minOut").textContent = $("minutes").value;
+  $("legendEnd").textContent = $("minutes").value + " min";
+  const v = +$("speed").value;
+  $("spdOut").textContent = `${v.toFixed(2)} m/s (${(v * 3.6).toFixed(1)} km/h)`;
+}
+function schedule() {
+  labels();
+  if (queued) return;
+  queued = true;
+  requestAnimationFrame(() => { queued = false; compute(); });
+}
+
+// ---------- compute ----------
+function compute() {
+  if (!G) return;
+  writeHash();
+  const T = $("minutes").value * 60, speed = +$("speed").value, avoid = $("steps").checked;
+  const snap = nearestNode(G, grid, origin.lng, origin.lat, 8);
+  if (snap.node < 0 || snap.dist > 500) {
+    state = null; $("stats").innerHTML = "";
+    statusEl.className = "err"; statusEl.textContent = "No street network within 500 m of this point. Try a spot inside the city.";
+    draw(); return;
+  }
+  statusEl.className = ""; statusEl.textContent = "";
+  const dAdj = dijkstra(G, snap.node, snap.dist / speed, speed, avoid, T);
+  const dRef = dijkstra(G, snap.node, snap.dist / REF_SPEED, REF_SPEED, false, T);
+  const reachAdj = collectReach(G, dAdj, T, speed, avoid), reachRef = collectReach(G, dRef, T, REF_SPEED, false);
+
+  const n = POIS.pts.length, inAdj = new Uint8Array(n), inRef = new Uint8Array(n);
+  const cats = POIS.cats.length, cAdj = new Array(cats).fill(0), cRef = new Array(cats).fill(0);
+  let stUsable = 0;
+  const stA = [0, 0, 0, 0], stR = [0, 0, 0, 0];   // reachable stations by wheelchair code
+  for (let i = 0; i < n; i++) {
+    const node = POIS.snap.node[i]; if (node < 0) continue;
+    const c = POIS.pts[i][2];
+    if (dAdj[node] + poiSnap[i] / speed <= T) {
+      inAdj[i] = 1; cAdj[c]++;
+      if (c === 6) { stA[POIS.pts[i][3]]++; if (!avoid || POIS.pts[i][3] === 1) stUsable++; }
+    }
+    if (dRef[node] + poiSnap[i] / REF_SPEED <= T) { inRef[i] = 1; cRef[c]++; if (c === 6) stR[POIS.pts[i][3]]++; }
+  }
+  state = { T, speed, avoid, reachAdj, reachRef, inAdj };
+  showStats(reachAdj, reachRef, cAdj, cRef, stUsable, stA, stR);
+  draw();
+}
+
+function showStats(rA, rR, cA, cR, stUsable, stA, stR) {
+  const ST = [[1, "Step-free (wheelchair=yes)"], [2, "Limited"], [3, "Not step-free (tagged no)"], [0, "Not tagged"]];
+  const stRows = ST.map(([code, label]) => `<tr><td><span class="dot st" style="background:${STATION_COLORS[code]}"></span>${label}</td><td>${stA[code]}</td><td>of ${stR[code]}</td></tr>`).join("");
+  const km = m => (m / 1000).toFixed(1), pct = rR.lengthM > 0 ? Math.round((rA.lengthM / rR.lengthM - 1) * 100) : 0;
+  const amen = [0, 1, 2, 3, 4];
+  const rows = amen.map(c => `<tr><td><span class="dot" style="background:${CAT_COLORS[c]}"></span>${POIS.cats[c]}</td><td>${cA[c]}</td><td>of ${cR[c]}</td></tr>`).join("");
+  const totA = amen.reduce((s, c) => s + cA[c], 0), totR = amen.reduce((s, c) => s + cR[c], 0);
+  const present = amen.filter(c => cA[c] > 0).length, perKm = rA.lengthM > 0 ? (totA / (rA.lengthM / 1000)).toFixed(1) : "0";
+  $("stats").innerHTML = `
+    <div><b>${km(rA.lengthM)} km</b> of streets reachable (${pct >= 0 ? "+" : ""}${pct}% vs. reference ${km(rR.lengthM)} km)</div>
+    <table>${rows}<tr><td><b>All amenities</b></td><td><b>${totA}</b></td><td>of ${totR}</td></tr></table>
+    <div class="note">${present} of 5 categories present, ${perKm} amenities per km of reachable street. Counts show your settings, then the reference.</div>
+    <div style="margin-top:8px">Benches: <b>${cA[5]}</b> of ${cR[5]}</div>
+    <div style="margin-top:10px"><b>Stations within reach</b>: ${cA[6]} of ${cR[6]}</div>
+    <table>${stRows}</table>
+    <div class="note">${state.avoid ? `With stair avoidance on, only step-free stations count as usable (${stUsable}); the others are shown faded.` : "Tick stair avoidance to fade the stations that are not usable."} Step-free status comes from OpenStreetMap tags; many stops are simply untagged.</div>`;
+}
+
+// ---------- drawing ----------
+function draw() {
+  const size = map.getSize(), dpr = window.devicePixelRatio || 1;
+  canvas.width = size.x * dpr; canvas.height = size.y * dpr;
+  canvas.style.width = size.x + "px"; canvas.style.height = size.y + "px";
+  L.DomUtil.setPosition(canvas, map.containerPointToLayerPoint([0, 0]));
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size.x, size.y);
+  if (!G || !state) return;
+
+  const z = map.getZoom(), S = 256 * Math.pow(2, z), tl = map.getPixelBounds().min;
+  const X = v => v * S - tl.x, Y = v => v * S - tl.y;
+  const width = Math.max(1.5, Math.min(5, 1.2 + (z - 12) * 0.5));
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+
+  const trace = (it) => {
+    let pts = edgePath(G, it.e, !it.fromLow);
+    if (it.frac < 1) pts = cutPath(pts, it.frac);
+    ctx.moveTo(X(pts[0]), Y(pts[1]));
+    for (let i = 2; i < pts.length; i += 2) ctx.lineTo(X(pts[i]), Y(pts[i + 1]));
+  };
+  // reference reach in grey, only where the current settings do not reach
+  const adjFrac = new Map(state.reachAdj.items.map(it => [it.e, it.frac]));
+  ctx.beginPath(); ctx.strokeStyle = "rgba(90,90,90,0.5)"; ctx.lineWidth = Math.max(1, width * 0.7);
+  for (const it of state.reachRef.items) if ((adjFrac.get(it.e) || 0) < it.frac - 1e-6) trace(it);
+  ctx.stroke();
+  // current reach, coloured by walking time
+  const bins = Array.from({ length: NB }, () => []);
+  for (const it of state.reachAdj.items) bins[Math.min(NB - 1, Math.floor(it.tt * NB))].push(it);
+  ctx.lineWidth = width;
+  bins.forEach((list, b) => {
+    if (!list.length) return;
+    ctx.beginPath(); ctx.strokeStyle = BIN_COLORS[b];
+    for (const it of list) trace(it);
+    ctx.stroke();
+  });
+
+  const showAm = $("showAm").checked, showSt = $("showSt").checked, showBn = $("showBn").checked;
+  const pts = POIS.pts;
+  for (let i = 0; i < pts.length; i++) {
+    if (!state.inAdj[i]) continue;
+    const c = pts[i][2];
+    if (c === 6) {
+      if (!showSt) continue;
+      const wc = pts[i][3], usable = !state.avoid || wc === 1;
+      ctx.globalAlpha = usable ? 1 : 0.35;
+      ctx.beginPath(); ctx.arc(X(poiMx[i]), Y(poiMy[i]), 7, 0, 6.2832);
+      ctx.fillStyle = STATION_COLORS[wc]; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = "#15171a"; ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else if (c === 5 ? showBn : showAm) {
+      ctx.beginPath(); ctx.arc(X(poiMx[i]), Y(poiMy[i]), c === 5 ? 2.2 : 3, 0, 6.2832);
+      ctx.fillStyle = CAT_COLORS[c]; ctx.globalAlpha = 0.9; ctx.fill(); ctx.globalAlpha = 1;
+    }
+  }
+}
+
+// ---------- shareable link: the settings live in the address after the # ----------
+let hashTimer;
+function writeHash() {
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    const q = new URLSearchParams({ lat: origin.lat.toFixed(5), lng: origin.lng.toFixed(5), min: $("minutes").value,
+      spd: $("speed").value, st: $("steps").checked ? 1 : 0, z: map.getZoom() });
+    try { history.replaceState(null, "", "#" + q.toString()); } catch (e) { /* some browsers limit this */ }
+  }, 300);
+}
+function applyHash(meta) {
+  const q = new URLSearchParams(location.hash.slice(1));
+  const num = (k, lo, hi) => { const v = parseFloat(q.get(k)); return Number.isFinite(v) && v >= lo && v <= hi ? v : null; };
+  const [minLon, minLat, maxLon, maxLat] = meta.bbox;
+  const lat = num("lat", minLat, maxLat), lng = num("lng", minLon, maxLon);
+  if (lat !== null && lng !== null) origin = L.latLng(lat, lng);
+  const m = num("min", 5, 30); if (m !== null) $("minutes").value = Math.round(m);
+  const sp = num("spd", 0.8, 1.8); if (sp !== null) $("speed").value = sp;
+  if (q.get("st") === "1") $("steps").checked = true;
+  labels();
+  const z = num("z", 10, 19);
+  return z !== null ? z : 14;
+}
+$("copyLink").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(location.href); $("copyMsg").textContent = "Link copied."; }
+  catch (e) { $("copyMsg").textContent = "Copy the address from your browser's address bar."; }
+  setTimeout(() => { $("copyMsg").textContent = ""; }, 3000);
+});
+
+// ---------- events ----------
+["minutes", "speed"].forEach(id => $(id).addEventListener("input", schedule));
+$("steps").addEventListener("change", schedule);
+["showAm", "showSt", "showBn"].forEach(id => $(id).addEventListener("change", draw));
+map.on("click", e => { origin = e.latlng; marker.setLatLng(origin); schedule(); });
+marker.on("drag", () => { origin = marker.getLatLng(); schedule(); });
+map.on("moveend resize zoomend", draw);
+
+// ---------- load ----------
+(async function load() {
+  labels();
+  try {
+    const [meta, buf, pois] = await Promise.all([
+      fetch(DATA_DIR + "meta.json").then(r => r.json()),
+      fetch(DATA_DIR + "graph.bin").then(r => { if (!r.ok) throw new Error("graph.bin not found"); return r.arrayBuffer(); }),
+      fetch(DATA_DIR + "pois.json").then(r => r.json())
+    ]);
+    G = parseGraph(buf); grid = buildGrid(G);
+    const snapped = snapPois(G, grid, pois.pts);
+    POIS = { cats: pois.cats, pts: pois.pts, snap: snapped };
+    poiSnap = snapped.snap;
+    poiMx = new Float64Array(pois.pts.length); poiMy = new Float64Array(pois.pts.length);
+    pois.pts.forEach((p, i) => { poiMx[i] = p[0] / 360 + 0.5; poiMy[i] = 0.5 - Math.log(Math.tan(Math.PI / 4 + p[1] * Math.PI / 360)) / (2 * Math.PI); });
+    const [minLon, minLat, maxLon, maxLat] = meta.bbox;
+    map.setMaxBounds([[minLat - 0.05, minLon - 0.08], [maxLat + 0.05, maxLon + 0.08]]);
+    map.setMinZoom(10);
+    origin = L.latLng(meta.start[0], meta.start[1]);
+    const near = nearestNode(G, grid, meta.start[1], meta.start[0], 12);   // the city centre point can fall in a river
+    if (near.node >= 0) origin = L.latLng(G.lat[near.node], G.lon[near.node]);
+    const zoom = applyHash(meta);
+    marker.setLatLng(origin);
+    map.setView(origin, zoom);
+    compute();
+  } catch (err) {
+    console.error(err);
+    statusEl.className = "err";
+    statusEl.textContent = "Could not load the street data (" + err.message + "). Run export_city.py first and open this page through a web server, not directly from disk.";
+  }
+})();
+</script>
+</body>
+</html>
