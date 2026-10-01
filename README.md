@@ -2,7 +2,7 @@
 
 An interactive map that shows how far you can walk in a given time, and how that changes with walking speed and with avoiding stairs. The same 15 minutes reach very different places for different people.
 
-Try it: <https://martincantcode.github.io/15-minutes/> (Cologne; more cities can be added, see below).
+Try it: <https://martincantcode.github.io/15-minutes/> (Cologne and Japan; more cities can be added, see below).
 
 Set a starting point by clicking the map, then adjust:
 
