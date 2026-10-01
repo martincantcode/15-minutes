@@ -38,6 +38,9 @@
   <h1>15 minutes.<br><span>For whom?</span></h1>
   <div class="note">Click the map or drag the marker. Coloured streets are what you can reach with your settings, coloured by walking time. Grey streets are reachable at 1.4 m/s with stairs allowed, but not with your settings.</div>
 
+  <div class="ctl" id="cityBox" style="display:none"><label>City
+    <select id="city" style="width:100%;font:inherit;padding:4px"></select></label></div>
+
   <div class="ctl"><label>Time budget: <b id="minOut">15</b> min
     <input type="range" id="minutes" min="5" max="30" value="15"></label></div>
 
@@ -74,18 +77,30 @@
 <script id="core">
 const R_LAT = 110540, R_LON = 111320;   // metres per degree (equirectangular, fine at city scale)
 
-// graph.bin layout: see export_city.py
+// graph.bin and tile files: layouts are described in export_city.py (version 1 = one whole city,
+// version 2 = one tile, which also carries the node numbers of the whole city and its amenities as JSON)
+function buildAdjacency(nN, nE, eu, ev) {
+  const deg = new Uint32Array(nN + 1);
+  for (let e = 0; e < nE; e++) { deg[eu[e]]++; deg[ev[e]]++; }
+  const adjStart = new Uint32Array(nN + 1);
+  for (let i = 0; i < nN; i++) adjStart[i + 1] = adjStart[i] + deg[i];
+  const fill = adjStart.slice(0, nN), adjEdge = new Uint32Array(2 * nE);
+  for (let e = 0; e < nE; e++) { adjEdge[fill[eu[e]]++] = e; adjEdge[fill[ev[e]]++] = e; }
+  return { adjStart, adjEdge };
+}
+
 function parseGraph(buf) {
-  const h = new Uint32Array(buf, 0, 4);
-  if (h[0] !== 1) throw new Error("Unsupported graph file version");
+  const h = new Uint32Array(buf, 0, 4), version = h[0];
+  if (version !== 1 && version !== 2) throw new Error("Unsupported data file version");
   const nN = h[1], nE = h[2], nS = h[3];
-  let off = 16;
+  let off = 16, poiLen = 0, ids = null;
+  if (version === 2) { poiLen = new Uint32Array(buf, 16, 1)[0]; off = 20; ids = new Uint32Array(buf, off, nN); off += 4 * nN; }
   const ll = new Int32Array(buf, off, 2 * nN); off += 8 * nN;
   const eu = new Uint32Array(buf, off, nE); off += 4 * nE;
   const ev = new Uint32Array(buf, off, nE); off += 4 * nE;
   const elf = new Uint32Array(buf, off, nE); off += 4 * nE;
   const sst = new Uint32Array(buf, off, nE + 1); off += 4 * (nE + 1);
-  const sp = new Int32Array(buf, off, 2 * nS);
+  const sp = new Int32Array(buf, off, 2 * nS); off += 8 * nS;
 
   const merc = (lon, lat) => [lon / 360 + 0.5, 0.5 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / (2 * Math.PI)];
   const lon = new Float64Array(nN), lat = new Float64Array(nN), mx = new Float64Array(nN), my = new Float64Array(nN);
@@ -97,17 +112,59 @@ function parseGraph(buf) {
   for (let i = 0; i < nS; i++) [smx[i], smy[i]] = merc(sp[2 * i] / 1e5, sp[2 * i + 1] / 1e5);
 
   const elen = new Float32Array(nE), eflag = new Uint8Array(nE);
-  const deg = new Uint32Array(nN + 1);
-  for (let e = 0; e < nE; e++) {
-    elen[e] = (elf[e] >>> 2) / 10;
-    eflag[e] = elf[e] & 3;
-    deg[eu[e]]++; deg[ev[e]]++;
+  for (let e = 0; e < nE; e++) { elen[e] = (elf[e] >>> 2) / 10; eflag[e] = elf[e] & 3; }
+  const { adjStart, adjEdge } = buildAdjacency(nN, nE, eu, ev);
+  return { nN, nE, lon, lat, mx, my, eu, ev, elen, eflag, sst, smx, smy, adjStart, adjEdge, ids, poiOff: off, poiLen };
+}
+
+// one tile: its street graph, plus the amenities that lie inside it
+function parseTile(buf) {
+  const graph = parseGraph(buf);
+  const pts = graph.poiLen > 0 ? JSON.parse(new TextDecoder().decode(new Uint8Array(buf, graph.poiOff, graph.poiLen))) : [];
+  return { graph, pts };
+}
+
+// Join several tiles into one graph. A node is the same node in every tile because tiles carry the node's
+// number from the whole city (ids); an edge that crosses a tile border sits in two tiles and is kept once.
+function mergeGraphs(parts, total) {
+  const nodeMap = new Int32Array(total).fill(-1);
+  const lon = [], lat = [], mx = [], my = [], gids = [];
+  const eu = [], ev = [], elen = [], eflag = [], sst = [0], smx = [], smy = [];
+  const seen = new Set();
+  const nodeOf = (p, local) => {
+    const gid = p.ids[local];
+    let i = nodeMap[gid];
+    if (i < 0) { i = nodeMap[gid] = lon.length; gids.push(gid); lon.push(p.lon[local]); lat.push(p.lat[local]); mx.push(p.mx[local]); my.push(p.my[local]); }
+    return i;
+  };
+  for (const p of parts) {
+    for (let e = 0; e < p.nE; e++) {
+      const gu = p.ids[p.eu[e]], gv = p.ids[p.ev[e]], flag = p.eflag[e];
+      const lo = gu < gv ? gu : gv, hi = gu < gv ? gv : gu;
+      const key = (lo * total + hi) * 2 + (flag & 1);   // the same street segment, whichever tile it comes from
+      if (seen.has(key)) continue;
+      seen.add(key);
+      eu.push(nodeOf(p, p.eu[e])); ev.push(nodeOf(p, p.ev[e]));
+      elen.push(p.elen[e]); eflag.push(flag);
+      for (let k = p.sst[e]; k < p.sst[e + 1]; k++) { smx.push(p.smx[k]); smy.push(p.smy[k]); }
+      sst.push(smx.length);
+    }
   }
-  const adjStart = new Uint32Array(nN + 1);
-  for (let i = 0; i < nN; i++) adjStart[i + 1] = adjStart[i] + deg[i];
-  const fill = adjStart.slice(0, nN), adjEdge = new Uint32Array(2 * nE);
-  for (let e = 0; e < nE; e++) { adjEdge[fill[eu[e]]++] = e; adjEdge[fill[ev[e]]++] = e; }
-  return { nN, nE, lon, lat, mx, my, eu, ev, elen, eflag, sst, smx, smy, adjStart, adjEdge };
+  const nN = lon.length, nE = eu.length;
+  const g = { nN, nE, ids: Uint32Array.from(gids), lon: Float64Array.from(lon), lat: Float64Array.from(lat), mx: Float64Array.from(mx), my: Float64Array.from(my),
+    eu: Uint32Array.from(eu), ev: Uint32Array.from(ev), elen: Float32Array.from(elen), eflag: Uint8Array.from(eflag),
+    sst: Uint32Array.from(sst), smx: Float64Array.from(smx), smy: Float64Array.from(smy) };
+  return Object.assign(g, buildAdjacency(nN, nE, g.eu, g.ev));
+}
+
+// which tiles cover a circle of radiusM metres around a point (t = tile grid from meta.json, have = Set of tile keys that exist)
+function tileKeysFor(t, have, lat, lon, radiusM) {
+  const dLat = radiusM / R_LAT, dLon = radiusM / (R_LON * Math.cos(lat * Math.PI / 180));
+  const x0 = Math.floor((lon - dLon - t.lon0) / t.dlon), x1 = Math.floor((lon + dLon - t.lon0) / t.dlon);
+  const y0 = Math.floor((lat - dLat - t.lat0) / t.dlat), y1 = Math.floor((lat + dLat - t.lat0) / t.dlat);
+  const keys = [];
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) { const k = x + "_" + y; if (have.has(k)) keys.push(k); }
+  return keys;
 }
 
 function buildGrid(g) {
@@ -139,7 +196,8 @@ function nearestNode(g, grid, lon, lat, maxRing = 8) {
       if (x < 0 || y < 0 || x >= grid.W || y >= grid.H) continue;
       for (let i = grid.head[y * grid.W + x]; i !== -1; i = grid.next[i]) {
         const d = Math.hypot((g.lon[i] - lon) * cosL * R_LON, (g.lat[i] - lat) * R_LAT);
-        if (d < bestD) { bestD = d; best = i; }
+        // on an exact tie take the node with the lower number from the whole city, so the answer does not depend on load order
+        if (d < bestD || (d === bestD && (g.ids ? g.ids[i] < g.ids[best] : i < best))) { bestD = d; best = i; }
       }
     }
     if (best !== -1 && bestD <= r * minCell) break;
@@ -247,7 +305,7 @@ function snapPois(g, grid, pts) {
 <script>
 // Basemap: OpenFreeMap vector tiles (free, no key, no request limits). Other styles: liberty, bright.
 const BASEMAP_STYLE = "https://tiles.openfreemap.org/styles/positron";
-const DATA_DIR = "data/cologne/";
+const DATA_ROOT = "data/";   // one folder per city, plus cities.json (the list for the menu)
 const REF_SPEED = 1.4;                        // reference walking speed, m/s (the slider default)
 const CAT_COLORS = ["#5b9a3c", "#d9534f", "#7b5ea7", "#2e8b57", "#e8a13a", "#8a5a2b", "#15171a"];
 // station dots by OSM wheelchair tag: 0 not tagged, 1 yes, 2 limited, 3 no
@@ -293,6 +351,10 @@ canvas.style.cssText = "position:absolute;pointer-events:none";
 map.getPanes().overlayPane.appendChild(canvas);
 
 let G = null, grid = null, POIS = null, poiMx = null, poiMy = null, poiSnap = null;
+// city and tile state (tiled cities load only the tiles around the point you click)
+let CITIES = [], CITY = "cologne", DATA_DIR = DATA_ROOT + "cologne/", META = null;
+let tileSet = null, tileCache = new Map(), tileInflight = new Map(), activeKeys = "";
+let computeToken = 0, needSnap = false, hashHadOrigin = false;
 let origin = L.latLng(50.9413, 6.9583), state = null, queued = false;
 const marker = L.marker(origin, { draggable: true }).addTo(map);
 
@@ -322,10 +384,33 @@ function schedule() {
 }
 
 // ---------- compute ----------
-function compute() {
-  if (!G) return;
-  writeHash();
+async function compute() {
+  if (!META) return;
+  const token = ++computeToken;   // a newer request makes older ones stop
   const T = $("minutes").value * 60, speed = +$("speed").value, avoid = $("steps").checked;
+  if (META.tiles) {
+    // the farthest anyone can get, plus the distance to the nearest street (up to 500 m)
+    const radius = T * Math.max(speed, REF_SPEED) + 500;
+    try { await ensureArea(origin.lat, origin.lng, radius, token); }
+    catch (err) {
+      if (token !== computeToken) return;
+      console.error(err);
+      statusEl.className = "err"; statusEl.textContent = "Could not load the map data for this area (" + err.message + ").";
+      return;
+    }
+    if (token !== computeToken) return;
+  }
+  if (!G) {
+    state = null; $("stats").innerHTML = "";
+    statusEl.className = "err"; statusEl.textContent = "This point is outside the area covered by the data.";
+    draw(); return;
+  }
+  if (needSnap) {   // the start point of a city can fall in a river or a park: move it to the nearest street
+    needSnap = false;
+    const near = nearestNode(G, grid, origin.lng, origin.lat, 12);
+    if (near.node >= 0) { origin = L.latLng(G.lat[near.node], G.lon[near.node]); marker.setLatLng(origin); }
+  }
+  writeHash();
   const snap = nearestNode(G, grid, origin.lng, origin.lat, 8);
   if (snap.node < 0 || snap.dist > 500) {
     state = null; $("stats").innerHTML = "";
@@ -353,6 +438,53 @@ function compute() {
   state = { T, speed, avoid, reachAdj, reachRef, inAdj };
   showStats(reachAdj, reachRef, cAdj, cRef, stUsable, stA, stR);
   draw();
+}
+
+// ---------- tiles ----------
+function setPois(cats, pts) {
+  const snapped = snapPois(G, grid, pts);
+  POIS = { cats, pts, snap: snapped };
+  poiSnap = snapped.snap;
+  poiMx = new Float64Array(pts.length); poiMy = new Float64Array(pts.length);
+  pts.forEach((p, i) => { poiMx[i] = p[0] / 360 + 0.5; poiMy[i] = 0.5 - Math.log(Math.tan(Math.PI / 4 + p[1] * Math.PI / 360)) / (2 * Math.PI); });
+}
+
+function loadTile(k) {
+  if (tileInflight.has(k)) return tileInflight.get(k);
+  const p = fetch(DATA_DIR + "t/" + k + ".bin")
+    .then(r => { if (!r.ok) throw new Error("tile " + k + " not found"); return r.arrayBuffer(); })
+    .then(buf => { tileCache.set(k, parseTile(buf)); })
+    .finally(() => tileInflight.delete(k));
+  tileInflight.set(k, p);
+  return p;
+}
+
+// make G (the street graph the search runs on) cover everything within radiusM of a point
+async function ensureArea(lat, lng, radiusM, token) {
+  const keys = tileKeysFor(META.tiles, tileSet, lat, lng, radiusM).sort();
+  const sig = keys.join(",");
+  if (sig === activeKeys) return;
+  const missing = keys.filter(k => !tileCache.has(k));
+  if (missing.length) {
+    statusEl.className = "";
+    statusEl.textContent = "Loading map data (" + missing.length + (missing.length === 1 ? " tile" : " tiles") + ")…";
+    await Promise.all(missing.map(loadTile));
+    if (token !== computeToken) return;
+  }
+  state = null;   // results refer to the old graph
+  G = keys.length ? mergeGraphs(keys.map(k => tileCache.get(k).graph), META.nodes) : null;
+  if (!G || G.nN === 0) { G = null; grid = null; POIS = null; }   // nothing but amenities (or nothing) here
+  else {
+    grid = buildGrid(G);
+    const pts = [];
+    for (const k of keys) for (const p of tileCache.get(k).pts) pts.push(p);
+    setPois(META.cats, pts);
+  }
+  activeKeys = sig;
+  statusEl.textContent = "";
+  if (tileCache.size > 60) {   // keep memory in check: forget tiles that are not in use
+    for (const k of Array.from(tileCache.keys())) { if (!keys.includes(k)) tileCache.delete(k); if (tileCache.size <= 40) break; }
+  }
 }
 
 function showStats(rA, rR, cA, cR, stUsable, stA, stR) {
@@ -453,17 +585,18 @@ let hashTimer;
 function writeHash() {
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
-    const q = new URLSearchParams({ lat: origin.lat.toFixed(5), lng: origin.lng.toFixed(5), min: $("minutes").value,
+    const q = new URLSearchParams({ city: CITY, lat: origin.lat.toFixed(5), lng: origin.lng.toFixed(5), min: $("minutes").value,
       spd: $("speed").value, st: $("steps").checked ? 1 : 0, z: map.getZoom() });
     try { history.replaceState(null, "", "#" + q.toString()); } catch (e) { /* some browsers limit this */ }
   }, 300);
 }
-function applyHash(meta) {
-  const q = new URLSearchParams(location.hash.slice(1));
+function applyHash(meta, fresh) {
+  // fresh = the city was just changed in the menu: the position in the address belongs to the old city
+  const q = fresh ? new URLSearchParams() : new URLSearchParams(location.hash.slice(1));
   const num = (k, lo, hi) => { const v = parseFloat(q.get(k)); return Number.isFinite(v) && v >= lo && v <= hi ? v : null; };
   const [minLon, minLat, maxLon, maxLat] = meta.bbox;
   const lat = num("lat", minLat, maxLat), lng = num("lng", minLon, maxLon);
-  if (lat !== null && lng !== null) origin = L.latLng(lat, lng);
+  if (lat !== null && lng !== null) { origin = L.latLng(lat, lng); hashHadOrigin = true; }
   const m = num("min", 5, 30); if (m !== null) $("minutes").value = Math.round(m);
   const sp = num("spd", 0.8, 1.8); if (sp !== null) $("speed").value = sp;
   if (q.get("st") === "1") $("steps").checked = true;
@@ -486,35 +619,69 @@ marker.on("drag", () => { origin = marker.getLatLng(); schedule(); });
 map.on("moveend resize zoomend", draw);
 
 // ---------- load ----------
-(async function load() {
-  labels();
+async function loadCities() {
+  try { const r = await fetch(DATA_ROOT + "cities.json"); if (r.ok) CITIES = (await r.json()).cities || []; } catch (e) { /* no list: single city */ }
+  if (!CITIES.length) CITIES = [{ id: "cologne", name: "Cologne" }];
+  if (CITIES.length > 1) {
+    const sel = $("city");
+    for (const c of CITIES) { const o = document.createElement("option"); o.value = c.id; o.textContent = c.name; sel.appendChild(o); }
+    $("cityBox").style.display = "";
+  }
+}
+
+async function loadCity(id, fresh) {
+  CITY = id; DATA_DIR = DATA_ROOT + id + "/";
+  computeToken++;   // stop whatever was still running for the previous city
+  META = null; G = null; grid = null; POIS = null; state = null; activeKeys = ""; tileSet = null;
+  tileCache = new Map(); tileInflight = new Map();
+  $("stats").innerHTML = "";
+  statusEl.className = ""; statusEl.textContent = "Loading street network…";
+  draw();
   try {
-    const [meta, buf, pois] = await Promise.all([
-      fetch(DATA_DIR + "meta.json").then(r => r.json()),
-      fetch(DATA_DIR + "graph.bin").then(r => { if (!r.ok) throw new Error("graph.bin not found"); return r.arrayBuffer(); }),
-      fetch(DATA_DIR + "pois.json").then(r => r.json())
-    ]);
-    G = parseGraph(buf); grid = buildGrid(G);
-    const snapped = snapPois(G, grid, pois.pts);
-    POIS = { cats: pois.cats, pts: pois.pts, snap: snapped };
-    poiSnap = snapped.snap;
-    poiMx = new Float64Array(pois.pts.length); poiMy = new Float64Array(pois.pts.length);
-    pois.pts.forEach((p, i) => { poiMx[i] = p[0] / 360 + 0.5; poiMy[i] = 0.5 - Math.log(Math.tan(Math.PI / 4 + p[1] * Math.PI / 360)) / (2 * Math.PI); });
+    const meta = await fetch(DATA_DIR + "meta.json").then(r => { if (!r.ok) throw new Error("meta.json not found"); return r.json(); });
+    if (id !== CITY) return;   // the menu was changed again while loading
+    if (meta.tiles) tileSet = new Set(meta.tiles.list);
+    else {   // a whole city in one file
+      const [buf, pois] = await Promise.all([
+        fetch(DATA_DIR + "graph.bin").then(r => { if (!r.ok) throw new Error("graph.bin not found"); return r.arrayBuffer(); }),
+        fetch(DATA_DIR + "pois.json").then(r => r.json())
+      ]);
+      if (id !== CITY) return;
+      G = parseGraph(buf); grid = buildGrid(G);
+      setPois(pois.cats, pois.pts);
+    }
     const [minLon, minLat, maxLon, maxLat] = meta.bbox;
+    origin = L.latLng(meta.start[0], meta.start[1]);
+    hashHadOrigin = false;
+    const zoom = applyHash(meta, fresh);
+    needSnap = !hashHadOrigin;
+    marker.setLatLng(origin);
+    map.setMaxBounds(null);
+    map.setView(origin, zoom);
     map.setMaxBounds([[minLat - 0.05, minLon - 0.08], [maxLat + 0.05, maxLon + 0.08]]);
     map.setMinZoom(10);
-    origin = L.latLng(meta.start[0], meta.start[1]);
-    const near = nearestNode(G, grid, meta.start[1], meta.start[0], 12);   // the city centre point can fall in a river
-    if (near.node >= 0) origin = L.latLng(G.lat[near.node], G.lon[near.node]);
-    const zoom = applyHash(meta);
-    marker.setLatLng(origin);
-    map.setView(origin, zoom);
+    META = meta;
     compute();
   } catch (err) {
     console.error(err);
     statusEl.className = "err";
-    statusEl.textContent = "Could not load the street data (" + err.message + "). Run export_city.py first and open this page through a web server, not directly from disk.";
+    statusEl.textContent = "Could not load the data for this city (" + err.message + "). Run export_city.py first and open this page through a web server, not directly from disk.";
   }
+}
+
+$("city").addEventListener("change", () => {
+  const id = $("city").value;
+  try { history.replaceState(null, "", "#city=" + encodeURIComponent(id)); } catch (e) { /* some browsers limit this */ }
+  loadCity(id, true);
+});
+
+(async function start() {
+  labels();
+  await loadCities();
+  const wanted = new URLSearchParams(location.hash.slice(1)).get("city");
+  const id = CITIES.some(c => c.id === wanted) ? wanted : CITIES[0].id;
+  $("city").value = id;
+  await loadCity(id, false);
 })();
 </script>
 </body>
