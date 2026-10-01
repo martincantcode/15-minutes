@@ -6,6 +6,7 @@
 <title>15 minutes. For whom?</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚶</text></svg>">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="vendor/maplibre-gl.css">
 <style>
   :root { --ink:#15171a; --paper:#f7f4ec; --teal:#1f7a99; }
   * { box-sizing: border-box; }
@@ -28,6 +29,7 @@
   #status { min-height: 2.6em; margin-top: 8px; font-size: 13px; }
   #status.err { color: #b3261e; }
   #map { flex: 1; }
+  .leaflet-container { background: #f1efe9; }
   @media (max-width: 700px) { body { flex-direction: column-reverse; } #panel { width: 100%; height: 55%; } }
 </style>
 </head>
@@ -59,11 +61,14 @@
   <div id="stats"></div>
   <div id="status">Loading street network…</div>
   <div class="note">Not included: public transport travel, slope, lighting. Street, amenity and station data come from OpenStreetMap and are incomplete in places. Stations count as step-free only if OSM tags them wheelchair=yes.</div>
+  <div class="note" id="baseNote" style="margin-top:8px"></div>
   <div class="note" style="margin-top:8px"><a href="impressum.html">Impressum / Legal notice</a></div>
 </div>
 <div id="map"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="vendor/maplibre-gl.js"></script>
+<script src="vendor/leaflet-maplibre-gl.js"></script>
 
 <!-- ============ CORE: no browser or Leaflet dependencies, so it can be tested in Node ============ -->
 <script id="core">
@@ -240,7 +245,8 @@ function snapPois(g, grid, pts) {
 
 <!-- ============ APP ============ -->
 <script>
-const MAPTILER_KEY = "GCu4G3vyHD9T5M6LgLzW";   // restricted to this site's address in MapTiler; in a copy, use your own key or "" for OpenTopoMap
+// Basemap: OpenFreeMap vector tiles (free, no key, no request limits). Other styles: liberty, bright.
+const BASEMAP_STYLE = "https://tiles.openfreemap.org/styles/positron";
 const DATA_DIR = "data/cologne/";
 const REF_SPEED = 1.4;                        // reference walking speed, m/s (the slider default)
 const CAT_COLORS = ["#5b9a3c", "#d9534f", "#7b5ea7", "#2e8b57", "#e8a13a", "#8a5a2b", "#15171a"];
@@ -252,15 +258,34 @@ const $ = id => document.getElementById(id);
 const statusEl = $("status");
 
 // ---------- map ----------
-const map = L.map("map", { zoomControl: true }).setView([50.9413, 6.9583], 14);
-if (MAPTILER_KEY) {
-  L.tileLayer(`https://api.maptiler.com/maps/dataviz-light/256/{z}/{x}/{y}.png?key=${MAPTILER_KEY}`, {
-    maxZoom: 19, attribution: "&copy; MapTiler &copy; OpenStreetMap contributors"
+const map = L.map("map", { zoomControl: true, maxZoom: 19 }).setView([50.9413, 6.9583], 14);
+let baseLayer = null, streetBase = false, mapErrors = 0;
+// Basemap of last resort: if the background map cannot be shown (no WebGL, a script that did not load, or the tile
+// service refusing requests), stop using it and draw the street network itself, which needs no outside service.
+function useStreetBase(reason) {
+  if (streetBase) return;
+  streetBase = true;
+  try { if (baseLayer) map.removeLayer(baseLayer); } catch (e) { /* already gone */ }
+  map.attributionControl.addAttribution("&copy; OpenStreetMap contributors");
+  document.getElementById("baseNote").textContent = "The background map is unavailable (" + String(reason || "unknown reason").slice(0, 160) + "), so the street network is shown instead.";
+  draw();
+}
+try {
+  baseLayer = L.maplibreGL({
+    style: BASEMAP_STYLE,
+    attributionControl: { customAttribution: '<a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> &copy; <a href="https://openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>' }
   }).addTo(map);
-} else {
-  L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", {
-    subdomains: "abc", maxZoom: 17, attribution: "Map data &copy; OpenStreetMap contributors | Style &copy; OpenTopoMap"
-  }).addTo(map);
+  // count failed tile loads (MapLibre also reports harmless style warnings, which have no tile or source)
+  let logged = 0;
+  baseLayer.getMaplibreMap().on("error", e => {
+    const msg = e && e.error && e.error.message ? e.error.message : "unknown error";
+    if (logged++ < 10) console.warn("Basemap error:", msg, "| source:", e && e.sourceId);
+    if (e && (e.tile || e.sourceId) && ++mapErrors >= 8) useStreetBase(msg);
+  });
+} catch (err) {
+  console.warn("Background map could not start:", err);
+  baseLayer = null;
+  setTimeout(() => useStreetBase(err && err.message ? err.message : err), 0);
 }
 const canvas = document.createElement("canvas");
 canvas.className = "leaflet-zoom-hide";
@@ -349,6 +374,21 @@ function showStats(rA, rR, cA, cR, stUsable, stA, stR) {
 }
 
 // ---------- drawing ----------
+// Basemap of last resort: every street in view as a faint line (zoomed out too far, there are too many to draw).
+function drawStreetBase(ctx, X, Y, S, tl, size) {
+  const x0 = tl.x / S, x1 = (tl.x + size.x) / S, y0 = tl.y / S, y1 = (tl.y + size.y) / S;   // view edges in mercator units
+  ctx.beginPath(); ctx.strokeStyle = "rgba(110,110,110,0.35)"; ctx.lineWidth = 1;
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (let e = 0; e < G.nE; e++) {
+    const u = G.eu[e], v = G.ev[e], ux = G.mx[u], uy = G.my[u], vx = G.mx[v], vy = G.my[v];
+    if ((ux < x0 && vx < x0) || (ux > x1 && vx > x1) || (uy < y0 && vy < y0) || (uy > y1 && vy > y1)) continue;
+    const p = edgePath(G, e, false);
+    ctx.moveTo(X(p[0]), Y(p[1]));
+    for (let i = 2; i < p.length; i += 2) ctx.lineTo(X(p[i]), Y(p[i + 1]));
+  }
+  ctx.stroke();
+}
+
 function draw() {
   const size = map.getSize(), dpr = window.devicePixelRatio || 1;
   canvas.width = size.x * dpr; canvas.height = size.y * dpr;
@@ -357,10 +397,12 @@ function draw() {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, size.x, size.y);
-  if (!G || !state) return;
+  if (!G) return;
 
   const z = map.getZoom(), S = 256 * Math.pow(2, z), tl = map.getPixelBounds().min;
   const X = v => v * S - tl.x, Y = v => v * S - tl.y;
+  if (streetBase && z >= 12) drawStreetBase(ctx, X, Y, S, tl, size);
+  if (!state) return;
   const width = Math.max(1.5, Math.min(5, 1.2 + (z - 12) * 0.5));
   ctx.lineCap = "round"; ctx.lineJoin = "round";
 
