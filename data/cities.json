@@ -1,0 +1,12 @@
+{
+ "cities": [
+  {
+   "id": "cologne",
+   "name": "Köln, Germany"
+  },
+  {
+   "id": "tokyo",
+   "name": "Tokyo (Shibuya)"
+  }
+ ]
+}
