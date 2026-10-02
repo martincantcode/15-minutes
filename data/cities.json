@@ -11,6 +11,10 @@
   {
    "id": "cdmx",
    "name": "Ciudad de México"
+  },
+  {
+   "id": "london",
+   "name": "London"
   }
  ]
 }
