@@ -8,6 +8,7 @@ Usage:
     python export_city.py "Köln, Germany" cologne --radius 6000     # smaller area, lighter download
     python export_city.py "Köln, Germany" cologne --overpass https://overpass.private.coffee/api
     python export_city.py "Shibuya Station, Tokyo, Japan" tokyo --name "Tokyo (Shibuya)" --radius 8000 --tile-km 2.5
+    python export_city.py "Mexico City" cdmx --name "Ciudad de México" --center 19.35,-99.14 --radius 15000 --tile-km 3.5
 
 Output, in data/<slug>/:
     graph.bin   street network (binary, read directly by the page)      } one city, loaded all at once
@@ -283,10 +284,21 @@ def main():
     ap.add_argument("place", help='place name, e.g. "Köln, Germany"')
     ap.add_argument("slug", help="output folder name under data/, e.g. cologne")
     ap.add_argument("--radius", type=int, help="only export this many metres around the place centre (much lighter for the servers)")
+    ap.add_argument("--center", help='latitude,longitude of the centre of that square, for example "19.35,-99.14", instead of looking the place up (the place name is then only a label); needs --radius')
     ap.add_argument("--overpass", help="use another Overpass server, e.g. https://overpass.private.coffee/api")
     ap.add_argument("--tile-km", type=float, help="cut the data into square tiles of this size (about 2.5 is a good start); the page then loads only the tiles around the point you click, which makes big areas possible")
     ap.add_argument("--name", help="name shown in the page's city menu (default: the place name)")
     args = ap.parse_args()
+    if args.center and not args.radius:
+        ap.error("--center needs --radius")
+    manual_center = None
+    if args.center:
+        try:
+            lat_s, lon_s = args.center.split(",")
+            manual_center = (float(lat_s), float(lon_s))
+            assert -90 <= manual_center[0] <= 90 and -180 <= manual_center[1] <= 180
+        except (ValueError, AssertionError):
+            ap.error('--center must look like "19.35,-99.14" (latitude,longitude in degrees)')
 
     import osmnx as ox
 
@@ -302,7 +314,7 @@ def main():
     center = None
     print("Downloading the walking network ... (a busy server answers 504 and the script retries; that can take a while)")
     if args.radius:
-        center = ox.geocode(args.place)   # (lat, lon)
+        center = manual_center or ox.geocode(args.place)   # (lat, lon)
         G = ox.graph_from_point(center, dist=args.radius, dist_type="bbox", network_type="walk", simplify=False)
     else:
         G = ox.graph_from_place(args.place, network_type="walk", simplify=False)
