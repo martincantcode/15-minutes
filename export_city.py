@@ -62,6 +62,18 @@ def is_steps(highway):
     return "steps" in values
 
 
+def step_kind(data):
+    """0 = an ordinary way, 1 = steps that stop someone who cannot use stairs, 2 = steps that come with a
+    wheelchair ramp (OpenStreetMap: ramp:wheelchair=yes), which that person can use instead.
+    Other ramp tags do not count: ramp=yes alone can mean a stroller or bicycle ramp, and ramp=separate means
+    the ramp is its own way, which is already part of the network."""
+    if not is_steps(data.get("highway")):
+        return 0
+    ramp = data.get("ramp:wheelchair")
+    values = ramp if isinstance(ramp, (list, tuple)) else [ramp]
+    return 2 if all(v == "yes" for v in values) else 1
+
+
 def haversine_m(lon1, lat1, lon2, lat2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
     a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
@@ -77,18 +89,19 @@ def build_graph_arrays(G, simplify_tol_deg=3e-5):
 
     Returns a dict: lonlat (int32, degrees * 1e5), eu / ev (edge end nodes, uint32), lf (length in
     decimetres << 2 | flags, uint32), shape_start (uint32, edges + 1) and shape_arr (int32 lon/lat pairs).
-    Flag bit 0 = the edge is a flight of steps. Shape points are the bends between the two end nodes.
+    Flag bit 0 = a flight of steps, bit 1 = a flight of steps with a wheelchair ramp (see step_kind).
+    Shape points are the bends between the two end nodes.
     """
     nodes = list(G.nodes)
     index = {n: i for i, n in enumerate(nodes)}
     lonlat = np.array([(e5(G.nodes[n]["x"]), e5(G.nodes[n]["y"])) for n in nodes], dtype=np.int32).reshape(-1, 2)
 
-    best = {}   # (low node, high node, steps) -> (length in m, interior points low -> high)
+    best = {}   # (low node, high node, kind) -> (length in m, interior points low -> high)
     for u, v, _key, data in G.edges(keys=True, data=True):
         a, b = index[u], index[v]
         if a == b:
             continue
-        steps = is_steps(data.get("highway"))
+        kind = step_kind(data)
         length = data.get("length")
         if length is None:
             length = haversine_m(G.nodes[u]["x"], G.nodes[u]["y"], G.nodes[v]["x"], G.nodes[v]["y"])
@@ -99,7 +112,7 @@ def build_graph_arrays(G, simplify_tol_deg=3e-5):
             interior = [(e5(x), e5(y)) for x, y in coords[1:-1]]
             if a > b:
                 interior.reverse()
-        key = (min(a, b), max(a, b), steps)
+        key = (min(a, b), max(a, b), kind)
         if key not in best or length < best[key][0]:
             best[key] = (float(length), interior)
 
@@ -111,10 +124,10 @@ def build_graph_arrays(G, simplify_tol_deg=3e-5):
     shape_start = np.zeros(n_edges + 1, dtype="<u4")
     shape_pts = []
     for i, key in enumerate(keys):
-        a, b, steps = key
+        a, b, kind = key
         length, interior = best[key]
         eu[i], ev[i] = a, b
-        lf[i] = (min(int(round(length * 10)), (1 << 30) - 1) << 2) | (1 if steps else 0)
+        lf[i] = (min(int(round(length * 10)), (1 << 30) - 1) << 2) | kind
         shape_pts.extend(interior)
         shape_start[i + 1] = len(shape_pts)
     shape_arr = np.array(shape_pts, dtype="<i4").reshape(-1, 2)
@@ -123,7 +136,9 @@ def build_graph_arrays(G, simplify_tol_deg=3e-5):
 
 def graph_summary(a):
     lonlat = a["lonlat"]
+    flags = a["lf"] & 3
     return {"nodes": len(lonlat), "edges": len(a["eu"]), "shape_points": len(a["shape_arr"]),
+            "steps": int((flags == 1).sum()), "steps_with_wheelchair_ramp": int((flags == 2).sum()),
             "bbox": [float(lonlat[:, 0].min() / 1e5), float(lonlat[:, 1].min() / 1e5),
                      float(lonlat[:, 0].max() / 1e5), float(lonlat[:, 1].max() / 1e5)]}
 
@@ -306,6 +321,8 @@ def main():
     ox.settings.log_console = True
     if args.overpass:
         ox.settings.overpass_url = args.overpass
+    # osmnx drops most way tags; keep the one that marks stairs with a wheelchair ramp
+    ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"ramp:wheelchair"})
     out = Path("data") / args.slug
     out.mkdir(parents=True, exist_ok=True)
     tags = {"shop": sorted(GROCERY), "amenity": sorted(HEALTH | EDUCATION | EATING | {"bench"}),
@@ -319,13 +336,15 @@ def main():
     else:
         G = ox.graph_from_place(args.place, network_type="walk", simplify=False)
     try:
-        G = ox.simplify_graph(G, edge_attrs_differ=["highway"])   # keeps steps as their own edges
+        G = ox.simplify_graph(G, edge_attrs_differ=["highway", "ramp:wheelchair"])   # keeps steps (and ramped steps) as their own edges
     except TypeError:
         print("Note: this OSMnx version cannot keep steps separate; edges containing steps are blocked whole.")
         G = ox.simplify_graph(G)
     arrays = build_graph_arrays(G)
     stats = graph_summary(arrays)
     print("Graph:", stats)
+    print("Steps: %d that block stair-free routes, %d with a wheelchair ramp tag (counted as passable)"
+          % (stats["steps"], stats["steps_with_wheelchair_ramp"]))
 
     print("Downloading amenities ...")
     if args.radius:
