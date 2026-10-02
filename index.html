@@ -22,6 +22,7 @@
   td { padding: 3px 0; border-bottom: 1px solid #ddd; }
   td:not(:first-child) { text-align: right; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  .keyline { display: inline-block; width: 18px; height: 3px; border-radius: 2px; margin-left: 4px; vertical-align: middle; }
   .dot.st { width: 12px; height: 12px; border: 2px solid #15171a; vertical-align: -2px; }
   #legend { height: 10px; border-radius: 5px; margin: 6px 0 2px; }
   #legendLabels { display: flex; justify-content: space-between; font-size: 12px; }
@@ -59,7 +60,8 @@
 
   <div class="ctl"><label><input type="checkbox" id="showAm" checked> Show amenities</label><br>
     <label><input type="checkbox" id="showSt" checked> Show stations within reach</label><br>
-    <label><input type="checkbox" id="showBn"> Show benches</label></div>
+    <label><input type="checkbox" id="showBn"> Show benches <span class="dot" style="background:#8a5a2b;width:7px;height:7px;margin:0 0 0 2px;vertical-align:middle"></span></label><br>
+    <label><input type="checkbox" id="showSteps"> Show stairs <span class="keyline" style="background:#c1272d"></span><span id="rampHint" style="display:none"> <span class="keyline" style="background:#e8a13a"></span> with wheelchair ramp</span></label></div>
 
   <div id="stats"></div>
   <div id="status">Loading street network…</div>
@@ -141,7 +143,7 @@ function mergeGraphs(parts, total) {
     for (let e = 0; e < p.nE; e++) {
       const gu = p.ids[p.eu[e]], gv = p.ids[p.ev[e]], flag = p.eflag[e];
       const lo = gu < gv ? gu : gv, hi = gu < gv ? gv : gu;
-      const key = (lo * total + hi) * 2 + (flag & 1);   // the same street segment, whichever tile it comes from
+      const key = (lo * total + hi) * 4 + (flag & 3);   // the same street segment, whichever tile it comes from
       if (seen.has(key)) continue;
       seen.add(key);
       eu.push(nodeOf(p, p.eu[e])); ev.push(nodeOf(p, p.ev[e]));
@@ -435,7 +437,7 @@ async function compute() {
     }
     if (dRef[node] + poiSnap[i] / REF_SPEED <= T) { inRef[i] = 1; cRef[c]++; if (c === 6) stR[POIS.pts[i][3]]++; }
   }
-  state = { T, speed, avoid, reachAdj, reachRef, inAdj };
+  state = { T, speed, avoid, reachAdj, reachRef, inAdj, dAdj };
   showStats(reachAdj, reachRef, cAdj, cRef, stUsable, stA, stR);
   draw();
 }
@@ -529,6 +531,7 @@ function draw() {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, size.x, size.y);
+  $("rampHint").style.display = "none";   // shown again below only if orange (ramped) steps are drawn
   if (!G) return;
 
   const z = map.getZoom(), S = 256 * Math.pow(2, z), tl = map.getPixelBounds().min;
@@ -560,6 +563,30 @@ function draw() {
     ctx.stroke();
   });
 
+  // flights of steps next to the area you can reach, so the places where avoiding stairs cuts a route can be seen
+  if ($("showSteps").checked && z >= 13) {
+    const x0 = tl.x / S, x1 = (tl.x + size.x) / S, y0 = tl.y / S, y1 = (tl.y + size.y) / S;   // view edges in mercator units
+    const strokeSteps = (flagBit, color) => {
+      let drawn = 0;
+      ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = Math.max(2.5, width + 1);
+      for (let e = 0; e < G.nE; e++) {
+        if (!(G.eflag[e] & flagBit)) continue;
+        const u = G.eu[e], v = G.ev[e];
+        if (!(state.dAdj[u] <= state.T || state.dAdj[v] <= state.T)) continue;   // only steps that touch the area you can reach
+        const ux = G.mx[u], uy = G.my[u], vx = G.mx[v], vy = G.my[v];
+        if ((ux < x0 && vx < x0) || (ux > x1 && vx > x1) || (uy < y0 && vy < y0) || (uy > y1 && vy > y1)) continue;
+        const pth = edgePath(G, e, false);
+        ctx.moveTo(X(pth[0]), Y(pth[1]));
+        for (let i = 2; i < pth.length; i += 2) ctx.lineTo(X(pth[i]), Y(pth[i + 1]));
+        drawn++;
+      }
+      ctx.stroke();
+      return drawn;
+    };
+    strokeSteps(1, "#c1272d");   // steps that block a route without stairs
+    // steps with a wheelchair ramp (OpenStreetMap ramp:wheelchair=yes): passable. Drawn last, so on top of the red ones.
+    if (strokeSteps(2, "#e8a13a") > 0) $("rampHint").style.display = "";
+  }
   const showAm = $("showAm").checked, showSt = $("showSt").checked, showBn = $("showBn").checked;
   const pts = POIS.pts;
   for (let i = 0; i < pts.length; i++) {
@@ -613,7 +640,7 @@ $("copyLink").addEventListener("click", async () => {
 // ---------- events ----------
 ["minutes", "speed"].forEach(id => $(id).addEventListener("input", schedule));
 $("steps").addEventListener("change", schedule);
-["showAm", "showSt", "showBn"].forEach(id => $(id).addEventListener("change", draw));
+["showAm", "showSt", "showBn", "showSteps"].forEach(id => $(id).addEventListener("change", draw));
 map.on("click", e => { origin = e.latlng; marker.setLatLng(origin); schedule(); });
 marker.on("drag", () => { origin = marker.getLatLng(); schedule(); });
 map.on("moveend resize zoomend", draw);
