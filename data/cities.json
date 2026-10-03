@@ -15,6 +15,10 @@
   {
    "id": "london",
    "name": "London"
+  },
+  {
+   "id": "gaziantep",
+   "name": "Gaziantep"
   }
  ]
 }
