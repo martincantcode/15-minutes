@@ -9,6 +9,7 @@ Set a starting point by clicking the map, then adjust:
 - **Time budget** (5 to 30 minutes)
 - **Walking speed** (0.8 to 1.8 m/s; the range follows the meta-study by Giannoulaki & Christoforou)
 - **Avoid stairs** (step-free)
+- **Account for slope** (only in cities that have height data): from 0 (hills make no difference) through the standard setting to a stricter one, and optionally **avoid slopes steeper than** a limit you choose (3 to 15 %). A "Show steep streets" option marks the streets above that limit.
 
 Streets you can reach are coloured by walking time. Streets that would be reachable at 1.4 m/s with stairs allowed, but not with your settings, are shown in grey. The panel counts amenities (groceries, health, education, parks and playgrounds, cafés and restaurants), benches and stations within reach, and shows which stations OpenStreetMap tags as step-free. A "Show stairs" option marks the flights of steps next to the area you can reach in red, which shows where avoiding stairs cuts a route; steps that OpenStreetMap tags with a wheelchair ramp (`ramp:wheelchair=yes`) are shown in orange and count as passable. A "Copy link to this view" button stores your settings, the city and the position in the address.
 
@@ -64,15 +65,35 @@ python export_city.py "Greater London, England" london --name London --center 51
 
 The categories, wheelchair tags and rules are the same as with the servers. The streets are still downloaded as before (and cached by osmnx); only the amenities come from the file.
 
-With either route, a large park or building is placed at the centre of its bounding box. Streets outside the boundary are not part of the data, so a reach that would cross the boundary stops there.
+With either route, a large park or building is placed at the centre of its bounding box. By default only the largest connected piece of the street network is kept, so that a click cannot land in a small disconnected fragment; `--keep-all` keeps every piece, and with the page's "Show all streets in the data" option the disconnected streets then show up in grey, which helps to find gaps in the data. Streets outside the boundary are not part of the data, so a reach that would cross the boundary stops there.
 
 Copy the new `data/<city>/` folder and the updated `data/cities.json` into the repository. A tiled city is many small files (one per tile). The GitHub website accepts at most 100 files per commit, so a larger city needs several uploads, or use GitHub Desktop or Git.
+
+## Terrain
+
+A city has terrain if `data/<city>/elev.bin` exists. It is made from a digital elevation model (DEM) by `add_elevation.py`, which reads the junctions of a city that is already exported, so the street data is not downloaded again:
+
+```
+pip install numpy rasterio pyproj requests
+python add_elevation.py luzern --swissalti3d          # Switzerland: downloads swisstopo's 2 m model automatically
+python add_elevation.py cologne --dem path/to/dem.tif  # any DEM as GeoTIFF file(s) or a folder of them
+```
+
+The slope of a street is the height difference between its two end junctions divided by its length (streets shorter than 20 m count as 20 m, so that a small height error does not look like a cliff). Only junctions are looked up in the DEM. Bridges and tunnels are therefore not a problem, because a bare-earth model shows a bridge as a valley, but its ends are on the ground. The price is that a street that climbs and falls between two junctions looks flatter than it is.
+
+Speed on a slope follows Tobler's hiking function (W = 6 exp(-3.5 |S + 0.05|) km/h, with S the slope as rise over run), expressed as a share of the speed on the flat: a 5 % climb makes you 16 % slower, a 10 % climb 30 % slower, and a gentle downhill of 5 % up to 19 % faster. The slider scales the penalty for climbing: at 0 it is off, at 1 it is Tobler as published, and at 2 it is twice as strict, which is close to the rule of thumb "every metre climbed counts as 10 m of walking" (30 % slower at 5 %, 50 % at 10 %). The downhill bonus is never made stronger than Tobler's. The grey reference area ignores slopes.
+
+The limit "avoid slopes steeper than X %" removes streets whose slope is above X % in either direction. 6 % is the general limit for an accessible pedestrian route in Spain's Orden TMA/851/2021 (the Madrid version uses it as its default), but the filter is not a compliance check: such rules allow steeper ramps under some conditions and measure slope along the path, which this tool cannot.
+
+Tobler's function describes walking on paths, not wheelchair use. Slope plus step-free routing is not a wheelchair route.
+
+Heights for Switzerland: swissALTI3D © swisstopo (open government data). Terrain in this tool was inspired by the Madrid version by [pablolamiquiz](https://github.com/pablolamiquiz/15--minutos-madrid), a fork of this project, which uses the same hiking function, a slope limit and a steep-street layer. The code here was written independently for this project's data format.
 
 ## Limits
 
 This is a prototype.
 
-- Public transport travel, slope and street lighting are not included.
+- Public transport travel and street lighting are not included. Slope is included only for cities with an `elev.bin` (see Terrain).
 - Street, amenity and station data come from OpenStreetMap and are incomplete in places. Stations count as step-free only if OpenStreetMap tags them `wheelchair=yes`.
 - Amenities are matched to the nearest street intersection, and parks and larger buildings count as single points, so counts near the edge of the reach are approximate.
 - Streets that OpenStreetMap marks as having separately mapped sidewalks may be missing from the network where those sidewalks are not mapped.

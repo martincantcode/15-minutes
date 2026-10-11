@@ -37,7 +37,7 @@
 <body>
 <div id="panel">
   <h1>15 minutes.<br><span>For whom?</span></h1>
-  <div class="note">Click the map or drag the marker. Coloured streets are what you can reach with your settings, coloured by walking time. Grey streets are reachable at 1.4 m/s with stairs allowed, but not with your settings.</div>
+  <div class="note">Click the map or drag the marker. Coloured streets are what you can reach with your settings, coloured by walking time. Grey streets are reachable at 1.4 m/s with stairs allowed and slopes ignored, but not with your settings.</div>
 
   <div class="ctl" id="cityBox" style="display:none"><label>City
     <select id="city" style="width:100%;font:inherit;padding:4px"></select></label></div>
@@ -47,9 +47,19 @@
 
   <div class="ctl"><label>Walking speed: <b id="spdOut"></b>
     <input type="range" id="speed" min="0.8" max="1.8" step="0.05" value="1.4"></label>
-    <div class="note">Range 0.8–1.8 m/s from the meta-study by Giannoulaki &amp; Christoforou.</div></div>
+    <div class="note">Range 0.8–1.8 m/s from the meta-study by <a href="https://www.mdpi.com/2071-1050/16/11/4813" target="_blank" rel="noopener">Giannoulaki &amp; Christoforou (2024)</a>.</div></div>
 
   <div class="ctl"><label><input type="checkbox" id="steps"> Avoid stairs (step-free)</label></div>
+
+  <div id="terrainBox" style="display:none">
+    <div class="ctl"><label>Account for slope: <b id="slopeOut"></b>
+      <input type="range" id="slope" min="0" max="2" step="0.1" value="1"></label>
+      <div class="note" id="slopeNote"></div>
+      <div class="note" style="margin-top:4px">"Standard" uses Tobler's hiking function (1993): you walk slower uphill and a little faster on gentle downhills. "Stricter" makes climbing count twice as much, about as in the rule of thumb "every metre climbed counts as 10 m of walking". The slope of a street is the height difference between its two ends divided by its length.</div></div>
+    <div class="ctl"><label><input type="checkbox" id="avoidSteep"> Avoid slopes steeper than <b id="maxOut">6</b> %
+      <input type="range" id="maxSlope" min="3" max="15" step="1" value="6"></label>
+      <div class="note"><span id="maxNote">6 % means 6 m of height gain per 100 m of street.</span> Streets above the limit are removed. Not a check against accessibility standards.</div></div>
+  </div>
 
   <div class="ctl">
     <div id="legend"></div>
@@ -61,7 +71,9 @@
   <div class="ctl"><label><input type="checkbox" id="showAm" checked> Show amenities</label><br>
     <label><input type="checkbox" id="showSt" checked> Show stations within reach</label><br>
     <label><input type="checkbox" id="showBn"> Show benches <span class="dot" style="background:#8a5a2b;width:7px;height:7px;margin:0 0 0 2px;vertical-align:middle"></span></label><br>
-    <label><input type="checkbox" id="showSteps"> Show stairs <span class="keyline" style="background:#c1272d"></span><span id="rampHint" style="display:none"> <span class="keyline" style="background:#e8a13a"></span> with wheelchair ramp</span></label></div>
+    <label><input type="checkbox" id="showSteps"> Show stairs <span class="keyline" style="background:#c1272d"></span><span id="rampHint" style="display:none"> <span class="keyline" style="background:#e8a13a"></span> with wheelchair ramp</span></label><br>
+    <label id="steepLbl" style="display:none"><input type="checkbox" id="showSteep"> Show steep streets (over <span id="steepPct">6</span> %, the limit set above) <span class="keyline" style="background:#7b4bb7"></span></label><br>
+    <label><input type="checkbox" id="showNet"> Show all streets in the data <span class="keyline" style="background:#9a9a9a;height:2px"></span></label></div>
 
   <div id="stats"></div>
   <div id="status">Loading street network…</div>
@@ -208,7 +220,7 @@ function nearestNode(g, grid, lon, lat, maxRing = 8) {
 }
 
 // Dijkstra over walking time; stops at T seconds. Speed in m/s. Returns seconds per node (Infinity = not reached).
-function dijkstra(g, src, startSeconds, speed, avoidSteps, T) {
+function dijkstra(g, src, startSeconds, speed, avoidSteps, T, tm) {   // tm = terrain from prepareTerrain, or null for flat ground
   const dist = new Float64Array(g.nN).fill(Infinity);
   const ht = [], hn = [];
   const push = (t, n) => {
@@ -236,8 +248,10 @@ function dijkstra(g, src, startSeconds, speed, avoidSteps, T) {
     for (let k = g.adjStart[n]; k < g.adjStart[n + 1]; k++) {
       const e = g.adjEdge[k];
       if (avoidSteps && (g.eflag[e] & 1)) continue;
-      const m = g.eu[e] === n ? g.ev[e] : g.eu[e];
-      const nt = t + g.elen[e] / speed;
+      if (tm && tm.block[e]) continue;
+      const forward = g.eu[e] === n;
+      const m = forward ? g.ev[e] : g.eu[e];
+      const nt = t + g.elen[e] / (tm ? speed * (forward ? tm.fwd[e] : tm.back[e]) : speed);
       if (nt < dist[m]) { dist[m] = nt; push(nt, m); }
     }
   }
@@ -274,18 +288,51 @@ function cutPath(pts, frac) {
   return out;
 }
 
+// ---- terrain ----
+// Walking speed on a slope, as a share of the speed on the flat (1 = same, 0.84 = 16 % slower).
+// S = rise / run (0.05 = a 5 % climb, negative = downhill). The shape is Tobler's hiking function,
+// W = 6 * exp(-3.5 * |S + 0.05|) km/h, divided by its value on the flat. `s` is the "account for slope" slider:
+// 0 = slopes make no difference, 1 = Tobler as published, 2 = twice as strict uphill (about the rule
+// "every metre climbed counts as 10 m of walking"). The downhill bonus is not made stronger than Tobler's.
+const TOBLER_K = 3.5, MIN_SLOPE_LEN = 20, MAX_SLOPE = 0.4;
+function slopeFactor(S, s) {
+  if (S > MAX_SLOPE) S = MAX_SLOPE; else if (S < -MAX_SLOPE) S = -MAX_SLOPE;
+  let pen = Math.abs(S + 0.05) - 0.05;          // 0 on the flat, > 0 slower than on the flat, < 0 faster
+  pen *= pen > 0 ? s : Math.min(s, 1);
+  return Math.exp(-TOBLER_K * pen);
+}
+
+// Per street: its slope (from the heights of its two end junctions; very short streets count as 20 m long so a
+// small height error does not look like a cliff), the speed factor in each direction, and whether it is too steep.
+// g.z = height of every junction in metres (NaN = unknown, treated as flat). maxSlope = 0.06 for 6 %, or 0 for no limit.
+function prepareTerrain(g, s, maxSlope) {
+  const key = s + "|" + maxSlope;
+  if (g.tm && g.tm.key === key) return g.tm;
+  const fwd = new Float32Array(g.nE).fill(1), back = new Float32Array(g.nE).fill(1);
+  const slope = new Float32Array(g.nE), block = new Uint8Array(g.nE);
+  for (let e = 0; e < g.nE; e++) {
+    const zu = g.z[g.eu[e]], zv = g.z[g.ev[e]];
+    if (!(zu === zu && zv === zv)) continue;
+    const S = (zv - zu) / Math.max(g.elen[e], MIN_SLOPE_LEN);
+    slope[e] = S; fwd[e] = slopeFactor(S, s); back[e] = slopeFactor(-S, s);
+    if (maxSlope && Math.abs(S) > maxSlope) block[e] = 1;
+  }
+  return (g.tm = { key, fwd, back, slope, block });
+}
+
 // every edge that is at least partly reachable: { e, fromLow, frac (share of the edge reached), tt (0..1 walking time) }
-function collectReach(g, dist, T, speed, avoidSteps) {
+function collectReach(g, dist, T, speed, avoidSteps, tm) {
   const items = [];
   let lengthM = 0;
   for (let e = 0; e < g.nE; e++) {
     if (avoidSteps && (g.eflag[e] & 1)) continue;
+    if (tm && tm.block[e]) continue;
     const du = dist[g.eu[e]], dv = dist[g.ev[e]];
     const fromLow = du <= dv, a = fromLow ? du : dv, b = fromLow ? dv : du;
     if (a > T) continue;
     let frac = 1, tt;
     if (b <= T) tt = b / T;
-    else { frac = Math.min(1, (T - a) / (g.elen[e] / speed)); tt = 1; }
+    else { frac = Math.min(1, (T - a) / (g.elen[e] / (tm ? speed * (fromLow ? tm.fwd[e] : tm.back[e]) : speed))); tt = 1; }
     items.push({ e, fromLow, frac, tt });
     lengthM += g.elen[e] * frac;
   }
@@ -352,6 +399,13 @@ canvas.className = "leaflet-zoom-hide";
 canvas.style.cssText = "position:absolute;pointer-events:none";
 map.getPanes().overlayPane.appendChild(canvas);
 
+let ELEV = null;   // heights of all junctions (int16, decimetres) from elev.bin, if this city has terrain
+function attachElevation(g) {   // g.z = height in metres per junction of g (NaN = unknown)
+  if (!ELEV) return;
+  const z = new Float32Array(g.nN);
+  for (let i = 0; i < g.nN; i++) { const v = ELEV[g.ids ? g.ids[i] : i]; z[i] = v === undefined || v === -32768 ? NaN : v / 10; }
+  g.z = z;
+}
 let G = null, grid = null, POIS = null, poiMx = null, poiMy = null, poiSnap = null;
 // city and tile state (tiled cities load only the tiles around the point you click)
 let CITIES = [], CITY = "cologne", DATA_DIR = DATA_ROOT + "cologne/", META = null;
@@ -377,6 +431,13 @@ function labels() {
   $("legendEnd").textContent = $("minutes").value + " min";
   const v = +$("speed").value;
   $("spdOut").textContent = `${v.toFixed(2)} m/s (${(v * 3.6).toFixed(1)} km/h)`;
+  const sl = +$("slope").value, pct = f => Math.round(Math.abs(1 - f) * 100);
+  $("slopeOut").textContent = sl === 0 ? "off" : Math.abs(sl - 1) < 0.05 ? "standard" : sl < 1 ? "weaker" : "stricter";
+  $("slopeNote").textContent = sl === 0 ? "Hills make no difference to your speed."
+    : `A 5 % climb makes you ${pct(slopeFactor(0.05, sl))} % slower, a 10 % climb ${pct(slopeFactor(0.10, sl))} % slower. Gentle downhill makes you up to ${pct(slopeFactor(-0.05, Math.min(sl, 1)))} % faster.`;
+  $("maxOut").textContent = $("maxSlope").value;
+  $("steepPct").textContent = $("maxSlope").value;
+  $("maxNote").textContent = `${$("maxSlope").value} % means ${$("maxSlope").value} m of height gain per 100 m of street.`;
 }
 function schedule() {
   labels();
@@ -392,7 +453,7 @@ async function compute() {
   const T = $("minutes").value * 60, speed = +$("speed").value, avoid = $("steps").checked;
   if (META.tiles) {
     // the farthest anyone can get, plus the distance to the nearest street (up to 500 m)
-    const radius = T * Math.max(speed, REF_SPEED) + 500;
+    const radius = T * Math.max(speed * (META.terrain ? 1.2 : 1), REF_SPEED) + 500;   // downhill can be up to 19 % faster
     try { await ensureArea(origin.lat, origin.lng, radius, token); }
     catch (err) {
       if (token !== computeToken) return;
@@ -420,9 +481,10 @@ async function compute() {
     draw(); return;
   }
   statusEl.className = ""; statusEl.textContent = "";
-  const dAdj = dijkstra(G, snap.node, snap.dist / speed, speed, avoid, T);
-  const dRef = dijkstra(G, snap.node, snap.dist / REF_SPEED, REF_SPEED, false, T);
-  const reachAdj = collectReach(G, dAdj, T, speed, avoid), reachRef = collectReach(G, dRef, T, REF_SPEED, false);
+  const tm = G.z ? prepareTerrain(G, +$("slope").value, $("avoidSteep").checked ? $("maxSlope").value / 100 : 0) : null;
+  const dAdj = dijkstra(G, snap.node, snap.dist / speed, speed, avoid, T, tm);
+  const dRef = dijkstra(G, snap.node, snap.dist / REF_SPEED, REF_SPEED, false, T);   // the grey reference ignores slopes
+  const reachAdj = collectReach(G, dAdj, T, speed, avoid, tm), reachRef = collectReach(G, dRef, T, REF_SPEED, false);
 
   const n = POIS.pts.length, inAdj = new Uint8Array(n), inRef = new Uint8Array(n);
   const cats = POIS.cats.length, cAdj = new Array(cats).fill(0), cRef = new Array(cats).fill(0);
@@ -475,6 +537,7 @@ async function ensureArea(lat, lng, radiusM, token) {
   }
   state = null;   // results refer to the old graph
   G = keys.length ? mergeGraphs(keys.map(k => tileCache.get(k).graph), META.nodes) : null;
+  if (G && G.nN > 0) attachElevation(G);
   if (!G || G.nN === 0) { G = null; grid = null; POIS = null; }   // nothing but amenities (or nothing) here
   else {
     grid = buildGrid(G);
@@ -536,7 +599,8 @@ function draw() {
 
   const z = map.getZoom(), S = 256 * Math.pow(2, z), tl = map.getPixelBounds().min;
   const X = v => v * S - tl.x, Y = v => v * S - tl.y;
-  if (streetBase && z >= 12) drawStreetBase(ctx, X, Y, S, tl, size);
+  // the whole street network of the data in faint grey: the basemap of last resort, or on request to see where the data has gaps
+  if ((streetBase && z >= 12) || ($("showNet").checked && z >= 13)) drawStreetBase(ctx, X, Y, S, tl, size);
   if (!state) return;
   const width = Math.max(1.5, Math.min(5, 1.2 + (z - 12) * 0.5));
   ctx.lineCap = "round"; ctx.lineJoin = "round";
@@ -587,6 +651,23 @@ function draw() {
     // steps with a wheelchair ramp (OpenStreetMap ramp:wheelchair=yes): passable. Drawn last, so on top of the red ones.
     if (strokeSteps(2, "#e8a13a") > 0) $("rampHint").style.display = "";
   }
+  // streets steeper than the limit that touch the area you can reach
+  if ($("showSteep").checked && G.tm && z >= 13) {
+    const lim = $("maxSlope").value / 100;
+    const x0 = tl.x / S, x1 = (tl.x + size.x) / S, y0 = tl.y / S, y1 = (tl.y + size.y) / S;
+    ctx.beginPath(); ctx.strokeStyle = "#7b4bb7"; ctx.lineWidth = Math.max(2.5, width + 1);
+    for (let e = 0; e < G.nE; e++) {
+      if (Math.abs(G.tm.slope[e]) <= lim) continue;
+      const u = G.eu[e], v = G.ev[e];
+      if (!(state.dAdj[u] <= state.T || state.dAdj[v] <= state.T)) continue;
+      const ux = G.mx[u], uy = G.my[u], vx = G.mx[v], vy = G.my[v];
+      if ((ux < x0 && vx < x0) || (ux > x1 && vx > x1) || (uy < y0 && vy < y0) || (uy > y1 && vy > y1)) continue;
+      const pth = edgePath(G, e, false);
+      ctx.moveTo(X(pth[0]), Y(pth[1]));
+      for (let i = 2; i < pth.length; i += 2) ctx.lineTo(X(pth[i]), Y(pth[i + 1]));
+    }
+    ctx.stroke();
+  }
   const showAm = $("showAm").checked, showSt = $("showSt").checked, showBn = $("showBn").checked;
   const pts = POIS.pts;
   for (let i = 0; i < pts.length; i++) {
@@ -613,7 +694,7 @@ function writeHash() {
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
     const q = new URLSearchParams({ city: CITY, lat: origin.lat.toFixed(5), lng: origin.lng.toFixed(5), min: $("minutes").value,
-      spd: $("speed").value, st: $("steps").checked ? 1 : 0, z: map.getZoom() });
+      spd: $("speed").value, st: $("steps").checked ? 1 : 0, sl: $("slope").value, ms: $("avoidSteep").checked ? $("maxSlope").value : 0, z: map.getZoom() });
     try { history.replaceState(null, "", "#" + q.toString()); } catch (e) { /* some browsers limit this */ }
   }, 300);
 }
@@ -627,6 +708,8 @@ function applyHash(meta, fresh) {
   const m = num("min", 5, 30); if (m !== null) $("minutes").value = Math.round(m);
   const sp = num("spd", 0.8, 1.8); if (sp !== null) $("speed").value = sp;
   if (q.get("st") === "1") $("steps").checked = true;
+  const sl = num("sl", 0, 2); if (sl !== null) $("slope").value = sl;
+  const ms = num("ms", 3, 15); if (ms !== null) { $("avoidSteep").checked = true; $("maxSlope").value = Math.round(ms); }
   labels();
   const z = num("z", 10, 19);
   return z !== null ? z : 14;
@@ -638,9 +721,9 @@ $("copyLink").addEventListener("click", async () => {
 });
 
 // ---------- events ----------
-["minutes", "speed"].forEach(id => $(id).addEventListener("input", schedule));
-$("steps").addEventListener("change", schedule);
-["showAm", "showSt", "showBn", "showSteps"].forEach(id => $(id).addEventListener("change", draw));
+["minutes", "speed", "slope", "maxSlope"].forEach(id => $(id).addEventListener("input", schedule));
+["steps", "avoidSteep"].forEach(id => $(id).addEventListener("change", schedule));
+["showAm", "showSt", "showBn", "showSteps", "showSteep", "showNet"].forEach(id => $(id).addEventListener("change", draw));
 map.on("click", e => { origin = e.latlng; marker.setLatLng(origin); schedule(); });
 marker.on("drag", () => { origin = marker.getLatLng(); schedule(); });
 map.on("moveend resize zoomend", draw);
@@ -659,7 +742,8 @@ async function loadCities() {
 async function loadCity(id, fresh) {
   CITY = id; DATA_DIR = DATA_ROOT + id + "/";
   computeToken++;   // stop whatever was still running for the previous city
-  META = null; G = null; grid = null; POIS = null; state = null; activeKeys = ""; tileSet = null;
+  META = null; G = null; grid = null; POIS = null; state = null; activeKeys = ""; tileSet = null; ELEV = null;
+  $("terrainBox").style.display = "none"; $("steepLbl").style.display = "none";
   tileCache = new Map(); tileInflight = new Map();
   $("stats").innerHTML = "";
   statusEl.className = ""; statusEl.textContent = "Loading street network…";
@@ -667,6 +751,13 @@ async function loadCity(id, fresh) {
   try {
     const meta = await fetch(DATA_DIR + "meta.json").then(r => { if (!r.ok) throw new Error("meta.json not found"); return r.json(); });
     if (id !== CITY) return;   // the menu was changed again while loading
+    if (meta.terrain) {   // heights of the junctions (made by add_elevation.py); without them the page simply has no slope controls
+      try {
+        const r = await fetch(DATA_DIR + meta.terrain.file);
+        if (r.ok) ELEV = new Int16Array(await r.arrayBuffer());
+      } catch (e) { console.warn("elev.bin not loaded", e); }
+      if (id !== CITY) return;
+    }
     if (meta.tiles) tileSet = new Set(meta.tiles.list);
     else {   // a whole city in one file
       const [buf, pois] = await Promise.all([
@@ -675,6 +766,8 @@ async function loadCity(id, fresh) {
       ]);
       if (id !== CITY) return;
       G = parseGraph(buf); grid = buildGrid(G);
+      if (ELEV && ELEV.length !== G.nN) { console.warn("elev.bin does not match graph.bin; terrain ignored"); ELEV = null; }
+      attachElevation(G);
       setPois(pois.cats, pois.pts);
     }
     const [minLon, minLat, maxLon, maxLat] = meta.bbox;
@@ -687,6 +780,8 @@ async function loadCity(id, fresh) {
     map.setView(origin, zoom);
     map.setMaxBounds([[minLat - 0.05, minLon - 0.08], [maxLat + 0.05, maxLon + 0.08]]);
     map.setMinZoom(10);
+    if (ELEV && meta.tiles && ELEV.length !== meta.nodes) { console.warn("elev.bin does not match the tiles; terrain ignored"); ELEV = null; }
+    if (ELEV) { $("terrainBox").style.display = ""; $("steepLbl").style.display = ""; }
     META = meta;
     compute();
   } catch (err) {
