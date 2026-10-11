@@ -19,6 +19,10 @@
   {
    "id": "gaziantep",
    "name": "Gaziantep"
+  },
+  {
+   "id": "luzern",
+   "name": "Luzern (Canton)"
   }
  ]
 }
