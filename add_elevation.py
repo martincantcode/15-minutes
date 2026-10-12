@@ -8,6 +8,8 @@ Usage:
     python add_elevation.py luzern --swissalti3d           # Switzerland: downloads swisstopo's 2 m model tile by tile
     python add_elevation.py cologne --dem path/to/dgm.tif  # any DEM you have as GeoTIFF(s); several files are fine
     python add_elevation.py cologne --dem tiles_folder/    # or a folder full of .tif files
+    python add_elevation.py innsbruck --dem DGM_Tirol_5m_epsg31254.zip --pbf austria-latest.osm.pbf   # recommended: ignores bridge decks (see below)
+    python add_elevation.py innsbruck --dem DGM_Tirol_5m_epsg31254.zip   # or a .zip with .tif files (unpacked into dem_cache/)
 
 What it writes:
     elev.bin     one int16 per junction, in decimetres (-32768 = no height known), in the order of the whole
@@ -17,7 +19,7 @@ What it writes:
 
 Why only junctions: the page works out the slope of a street from the height difference between its two ends.
 That avoids the classic trap of terrain models, which show a bridge as a deep valley (or a tunnel as a hill):
-only the ends of the street are looked up, and they are on the ground. A street that goes up and down between
+only the ends of the street are looked up, and they are on the ground. A junction in the middle of a bridge is the exception (the model would give it the height of the river bed): with --pbf the script finds such junctions in an OpenStreetMap extract and gives them no height, so the streets next to them count as flat. A street that goes up and down between
 two junctions looks flatter than it is - the same limit any junction-to-junction method has.
 """
 import argparse
@@ -105,6 +107,29 @@ def sample_dem(path, lon, lat, z):
         return found
 
 
+def deck_junction_keys(pbf, bbox):
+    """Positions (longitude and latitude in 1e-5 degrees, like the junctions in graph.bin) of nodes that lie on
+    bridges or in tunnels and on no ordinary street. A terrain model shows the ground under a bridge (the river
+    bed, the road below), so a junction in the middle of a bridge would get that height and the bridge would look
+    like a cliff. Nodes where a bridge meets the ground are NOT in this set: they are on the ground."""
+    try:
+        import osmium
+    except ImportError:
+        sys.exit("--pbf needs the package osmium. Install it with:  pip install osmium")
+    minx, miny, maxx, maxy = bbox
+    ground, deck = set(), set()
+    reader = osmium.FileProcessor(str(pbf)).with_locations().with_filter(osmium.filter.KeyFilter("highway"))
+    for obj in reader:
+        if not isinstance(obj, osmium.osm.Way):
+            continue
+        pts = [(n.location.lon, n.location.lat) for n in obj.nodes if n.location.valid()]
+        if not any(minx <= x <= maxx and miny <= y <= maxy for x, y in pts):
+            continue
+        is_deck = obj.tags.get("bridge", "no") != "no" or obj.tags.get("tunnel", "no") not in ("no", "building_passage")
+        (deck if is_deck else ground).update((int(round(x * 1e5)), int(round(y * 1e5))) for x, y in pts)
+    return deck - ground
+
+
 def swissalti3d_files(lon, lat, cache_dir):
     """Download swisstopo's swissALTI3D (2 m) for the area of the junctions; returns the file paths.
     The tiles are 1 km x 1 km. Where several years exist for one tile, the newest is used."""
@@ -157,6 +182,7 @@ def main():
     ap.add_argument("slug", help="the city's folder name under data/, e.g. luzern")
     ap.add_argument("--dem", nargs="+", help="GeoTIFF file(s) and/or folder(s) with GeoTIFFs")
     ap.add_argument("--swissalti3d", action="store_true", help="Switzerland only: download swisstopo's swissALTI3D (2 m, open data) automatically")
+    ap.add_argument("--pbf", help="OpenStreetMap extract (.osm.pbf) of the area: junctions that lie only on bridges or in tunnels then get no height from the terrain model (recommended where there are bridges over rivers or valleys; needs: pip install osmium)")
     ap.add_argument("--data", default="data", help="the data folder (default: data)")
     ap.add_argument("--cache", default="dem_cache", help="where downloaded elevation tiles are kept (default: dem_cache)")
     args = ap.parse_args()
@@ -176,6 +202,15 @@ def main():
         source.append("swissALTI3D 2 m, swisstopo (Federal Office of Topography), open government data")
     for item in args.dem or []:
         p = Path(item)
+        if p.suffix.lower() == ".zip":   # a zipped download: unpack it once into the cache folder and use the .tif files inside
+            import zipfile
+            target = Path(args.cache) / p.stem
+            if not target.exists():
+                print("Unpacking %s ..." % p.name)
+                with zipfile.ZipFile(p) as z:
+                    z.extractall(str(target) + ".part")
+                Path(str(target) + ".part").rename(target)
+            p = target
         files += sorted(p.rglob("*.tif")) + sorted(p.rglob("*.tiff")) if p.is_dir() else [p]
     if not files:
         sys.exit("No elevation files found.")
@@ -185,10 +220,18 @@ def main():
         got = sample_dem(f, lon, lat, z)
         print("  file %d of %d: %d junctions   " % (i, len(files), got), end="\r", flush=True)
     print()
+    if args.pbf:
+        print("Looking for bridges and tunnels in %s ..." % args.pbf)
+        ok = np.isfinite(lon)
+        deck = deck_junction_keys(args.pbf, (float(lon[ok].min()), float(lat[ok].min()), float(lon[ok].max()), float(lat[ok].max())))
+        kx, ky = np.round(lon * 1e5), np.round(lat * 1e5)
+        on_deck = np.array([ok[i] and (int(kx[i]), int(ky[i])) in deck for i in range(len(lon))])
+        z[on_deck] = np.nan
+        print("%d junctions lie on bridges or in tunnels only: their heights are ignored, and the streets next to them are treated as flat." % on_deck.sum())
     known = np.isfinite(z)
     print("Height found for %d of %d junctions (%.1f %%)." % (known.sum(), len(z), 100 * known.mean()))
     if known.mean() < 0.9:
-        print("Warning: fewer than 90 %% have a height. The page treats a street with an unknown end as flat.")
+        print("Warning: fewer than 90 % have a height. The page treats a street with an unknown end as flat.")
 
     out = np.full(len(z), NODATA, dtype="<i2")
     out[known] = np.clip(np.round(z[known] * 10), -32000, 32000).astype("<i2")

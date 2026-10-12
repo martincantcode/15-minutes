@@ -65,6 +65,14 @@ python export_city.py "Greater London, England" london --name London --center 51
 
 The categories, wheelchair tags and rules are the same as with the servers. The streets are still downloaded as before (and cached by osmnx); only the amenities come from the file.
 
+The public Overpass servers are sometimes overloaded or refuse connections. With `--pbf-streets` (together with `--pbf`) the walking network is read from the same file, so no server is needed at all:
+
+```
+python export_city.py "Innsbruck, Austria" innsbruck --center 47.2665,11.3945 --radius 20000 --tile-km 5 --pbf austria-latest.osm.pbf --pbf-streets
+```
+
+The rules for which ways count as walkable are the same as OSMnx applies for its walking network, so the result should match the server route; reading a country-sized file takes a few minutes. This route has been tested on a small synthetic extract, not compared street by street with the server route.
+
 With either route, a large park or building is placed at the centre of its bounding box. By default only the largest connected piece of the street network is kept, so that a click cannot land in a small disconnected fragment; `--keep-all` keeps every piece, and with the page's "Show all streets in the data" option the disconnected streets then show up in grey, which helps to find gaps in the data. Streets outside the boundary are not part of the data, so a reach that would cross the boundary stops there.
 
 Copy the new `data/<city>/` folder and the updated `data/cities.json` into the repository. A tiled city is many small files (one per tile). The GitHub website accepts at most 100 files per commit, so a larger city needs several uploads, or use GitHub Desktop or Git.
@@ -76,7 +84,7 @@ A city has terrain if `data/<city>/elev.bin` exists. It is made from a digital e
 ```
 pip install numpy rasterio pyproj requests
 python add_elevation.py luzern --swissalti3d          # Switzerland: downloads swisstopo's 2 m model automatically
-python add_elevation.py cologne --dem path/to/dem.tif  # any DEM as GeoTIFF file(s) or a folder of them
+python add_elevation.py cologne --dem path/to/dem.tif  # any DEM as GeoTIFF file(s), a folder of them, or a .zip
 ```
 
 The slope of a street is the height difference between its two end junctions divided by its length (streets shorter than 20 m count as 20 m, so that a small height error does not look like a cliff). Only junctions are looked up in the DEM. Bridges and tunnels are therefore not a problem, because a bare-earth model shows a bridge as a valley, but its ends are on the ground. The price is that a street that climbs and falls between two junctions looks flatter than it is.
@@ -87,7 +95,7 @@ The limit "avoid slopes steeper than X %" removes streets whose slope is above X
 
 Tobler's function describes walking on paths, not wheelchair use. Slope plus step-free routing is not a wheelchair route.
 
-Heights for Switzerland: swissALTI3D © swisstopo (open government data). Terrain in this tool was inspired by the Madrid version by [pablolamiquiz](https://github.com/pablolamiquiz/15--minutos-madrid), a fork of this project, which uses the same hiking function, a slope limit and a steep-street layer. The code here was written independently for this project's data format.
+Heights for Switzerland: swissALTI3D © swisstopo (open government data). Heights for Innsbruck: Digitales Geländemodell Tirol (5 m), © Land Tirol – data.gv.at, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Terrain in this tool was inspired by the Madrid version by [pablolamiquiz](https://github.com/pablolamiquiz/15--minutos-madrid), a fork of this project, which uses the same hiking function, a slope limit and a steep-street layer. The code here was written independently for this project's data format.
 
 ## Limits
 
@@ -96,6 +104,7 @@ This is a prototype.
 - Public transport travel and street lighting are not included. Slope is included only for cities with an `elev.bin` (see Terrain).
 - Street, amenity and station data come from OpenStreetMap and are incomplete in places. Stations count as step-free only if OpenStreetMap tags them `wheelchair=yes`.
 - Amenities are matched to the nearest street intersection, and parks and larger buildings count as single points, so counts near the edge of the reach are approximate.
+- With `--pbf-streets`, cycleways tagged `foot=yes`, `foot=designated` or `foot=permissive` count as walkable (shared foot and cycle paths, which is how many bridge sidewalks are mapped). The Overpass route leaves all cycleways out. `why_missing.py` shows, for any point, which nearby ways are kept or left out and why.
 - Streets that OpenStreetMap marks as having separately mapped sidewalks may be missing from the network where those sidewalks are not mapped.
 - Escalators are mapped in OpenStreetMap as steps, so avoiding stairs also avoids them; lifts are not modelled.
 - Only `ramp:wheelchair=yes` makes a flight of steps passable. `ramp=yes` alone can mean a stroller or bicycle ramp, and a ramp mapped as its own way is part of the network anyway. Ramps that are not tagged are not known to the tool. The export prints how many steps it found and how many carry the ramp tag.
