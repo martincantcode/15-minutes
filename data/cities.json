@@ -23,6 +23,10 @@
   {
    "id": "luzern",
    "name": "Luzern (Canton)"
+  },
+  {
+   "id": "innsbruck",
+   "name": "Innsbruck"
   }
  ]
 }
