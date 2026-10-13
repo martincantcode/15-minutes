@@ -6,6 +6,7 @@ The street data is NOT downloaded again.
 Usage:
     pip install numpy rasterio pyproj requests
     python add_elevation.py luzern --swissalti3d           # Switzerland: downloads swisstopo's 2 m model tile by tile
+    python add_elevation.py cologne --nrw-dgm1             # North Rhine-Westphalia: downloads Geobasis NRW's 1 m model for the squares with streets
     python add_elevation.py cologne --dem path/to/dgm.tif  # any DEM you have as GeoTIFF(s); several files are fine
     python add_elevation.py cologne --dem tiles_folder/    # or a folder full of .tif files
     python add_elevation.py innsbruck --dem DGM_Tirol_5m_epsg31254.zip --pbf austria-latest.osm.pbf   # recommended: ignores bridge decks (see below)
@@ -71,12 +72,15 @@ def bilinear(arr, r, c):
             + arr[r0 + 1, c0] * fr * (1 - fc) + arr[r0 + 1, c0 + 1] * fr * fc)
 
 
-def sample_dem(path, lon, lat, z):
-    """Fill z (metres, NaN = unknown) for the junctions that lie inside the DEM file `path`."""
+def sample_dem(path, lon, lat, z, only=None):
+    """Fill z (metres, NaN = unknown) for the junctions that lie inside the DEM file `path`.
+    `only`: optional array of junction numbers to look at (saves time when thousands of small files are used)."""
     import rasterio
     from pyproj import Transformer
     with rasterio.open(path) as ds:
         todo = np.where(np.isnan(z) & np.isfinite(lon))[0]
+        if only is not None:
+            todo = np.intersect1d(todo, only)
         if len(todo) == 0:
             return 0
         x, y = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True).transform(lon[todo], lat[todo])
@@ -177,17 +181,79 @@ def swissalti3d_files(lon, lat, cache_dir):
     return paths
 
 
+NRW_DGM1 = "https://www.opengeodata.nrw.de/produkte/geobasis/hm/dgm1_tiff/dgm1_tiff/"
+
+
+def nrw_dgm1_files(lon, lat, cache_dir):
+    """Download the 1 m terrain model of North Rhine-Westphalia (Geobasis NRW) for the 1 km x 1 km squares that contain
+    junctions. Returns {file path: array of the junction numbers inside that square}.
+    The file names carry the square's lower-left corner in km (ETRS89 / UTM 32, EPSG:25832) and the year of the data."""
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+    from pyproj import Transformer
+    ok = np.where(np.isfinite(lon))[0]
+    e, n = Transformer.from_crs("EPSG:4326", "EPSG:25832", always_xy=True).transform(lon[ok], lat[ok])
+    kx, ky = np.floor(e / 1000).astype(int), np.floor(n / 1000).astype(int)
+    groups = {}
+    for i, key in zip(ok.tolist(), zip(kx.tolist(), ky.tolist())):
+        groups.setdefault(key, []).append(i)
+    print("The junctions lie on %d different 1 km x 1 km squares." % len(groups))
+    print("Reading the list of available files from opengeodata.nrw.de ...")
+    resp = requests.get(NRW_DGM1, timeout=180)
+    resp.raise_for_status()
+    newest = {}   # (e_km, n_km) -> (year, file name)
+    for m in re.finditer(r"dgm1_32_(\d+)_(\d+)_1_nw_(\d{4})\.tif", resp.text):
+        key = (int(m.group(1)), int(m.group(2)))
+        if key in groups and (key not in newest or int(m.group(3)) > newest[key][0]):
+            newest[key] = (int(m.group(3)), m.group(0))
+    if not newest:
+        sys.exit("No file names found in the list from opengeodata.nrw.de (the server's list may have changed format).")
+    missing = len(groups) - len(newest)
+    if missing:
+        print("Note: no file for %d of the squares (outside North Rhine-Westphalia, or no data); those junctions get no height." % missing)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    todo = [(key, name) for key, (year, name) in sorted(newest.items()) if not (cache_dir / name).exists()]
+    print("%d files needed, %d already in %s." % (len(newest), len(newest) - len(todo), cache_dir))
+
+    def fetch(item):
+        key, name = item
+        for attempt in range(4):
+            try:
+                with requests.get(NRW_DGM1 + name, stream=True, timeout=120) as r:
+                    r.raise_for_status()
+                    with open(str(cache_dir / name) + ".part", "wb") as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+                (cache_dir / (name + ".part")).rename(cache_dir / name)
+                return True
+            except requests.RequestException:
+                pass
+        return False
+
+    done = failed = 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for okay in pool.map(fetch, todo):
+            done += 1
+            failed += 0 if okay else 1
+            print("  downloaded %d of %d ..." % (done, len(todo)), end="\r", flush=True)
+    print()
+    if failed:
+        print("Note: %d files could not be downloaded; run the same command again to fetch them (finished files are kept)." % failed)
+    return {cache_dir / name: np.array(groups[key]) for key, (year, name) in newest.items() if (cache_dir / name).exists()}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("slug", help="the city's folder name under data/, e.g. luzern")
     ap.add_argument("--dem", nargs="+", help="GeoTIFF file(s) and/or folder(s) with GeoTIFFs")
     ap.add_argument("--swissalti3d", action="store_true", help="Switzerland only: download swisstopo's swissALTI3D (2 m, open data) automatically")
+    ap.add_argument("--nrw-dgm1", action="store_true", help="North Rhine-Westphalia only: download Geobasis NRW's 1 m terrain model for the squares that contain junctions (about 2 MB per square; several GB for a big city)")
     ap.add_argument("--pbf", help="OpenStreetMap extract (.osm.pbf) of the area: junctions that lie only on bridges or in tunnels then get no height from the terrain model (recommended where there are bridges over rivers or valleys; needs: pip install osmium)")
     ap.add_argument("--data", default="data", help="the data folder (default: data)")
     ap.add_argument("--cache", default="dem_cache", help="where downloaded elevation tiles are kept (default: dem_cache)")
     args = ap.parse_args()
-    if not args.dem and not args.swissalti3d:
-        ap.error("give --dem FILE_OR_FOLDER or --swissalti3d")
+    if not args.dem and not args.swissalti3d and not args.nrw_dgm1:
+        ap.error("give --dem FILE_OR_FOLDER, --swissalti3d or --nrw-dgm1")
     try:
         import rasterio, pyproj  # noqa: F401
     except ImportError:
@@ -200,6 +266,11 @@ def main():
     if args.swissalti3d:
         files += swissalti3d_files(lon, lat, Path(args.cache) / "swissalti3d")
         source.append("swissALTI3D 2 m, swisstopo (Federal Office of Topography), open government data")
+    nrw = {}
+    if args.nrw_dgm1:
+        nrw = nrw_dgm1_files(lon, lat, Path(args.cache) / "nrw_dgm1")
+        files += list(nrw)
+        source.append("DGM1 1 m, Geobasis NRW (Land NRW)")
     for item in args.dem or []:
         p = Path(item)
         if p.suffix.lower() == ".zip":   # a zipped download: unpack it once into the cache folder and use the .tif files inside
@@ -217,7 +288,7 @@ def main():
 
     z = np.full(len(lon), np.nan)
     for i, f in enumerate(files, 1):
-        got = sample_dem(f, lon, lat, z)
+        got = sample_dem(f, lon, lat, z, nrw.get(f))
         print("  file %d of %d: %d junctions   " % (i, len(files), got), end="\r", flush=True)
     print()
     if args.pbf:

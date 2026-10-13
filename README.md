@@ -84,6 +84,7 @@ A city has terrain if `data/<city>/elev.bin` exists. It is made from a digital e
 ```
 pip install numpy rasterio pyproj requests
 python add_elevation.py luzern --swissalti3d          # Switzerland: downloads swisstopo's 2 m model automatically
+python add_elevation.py cologne --nrw-dgm1            # North Rhine-Westphalia: downloads Geobasis NRW's 1 m model for the 1 km squares that contain streets (about 2 MB each)
 python add_elevation.py cologne --dem path/to/dem.tif  # any DEM as GeoTIFF file(s), a folder of them, or a .zip
 ```
 
@@ -95,7 +96,7 @@ The limit "avoid slopes steeper than X %" removes streets whose slope is above X
 
 Tobler's function describes walking on paths, not wheelchair use. Slope plus step-free routing is not a wheelchair route.
 
-Heights for Switzerland: swissALTI3D © swisstopo (open government data). Heights for Innsbruck: Digitales Geländemodell Tirol (5 m), © Land Tirol – data.gv.at, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Terrain in this tool was inspired by the Madrid version by [pablolamiquiz](https://github.com/pablolamiquiz/15--minutos-madrid), a fork of this project, which uses the same hiking function, a slope limit and a steep-street layer. The code here was written independently for this project's data format.
+Heights for Switzerland: swissALTI3D © swisstopo (open government data). Heights for Cologne and surroundings: Digitales Geländemodell 1 m, Geobasis NRW, [Datenlizenz Deutschland – Zero – Version 2.0](https://www.govdata.de/dl-de/zero-2-0) (use without restrictions or conditions; credit given here anyway). Heights for Innsbruck: Digitales Geländemodell Tirol (5 m), © Land Tirol – data.gv.at, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Terrain in this tool was inspired by the Madrid version by [pablolamiquiz](https://github.com/pablolamiquiz/15--minutos-madrid), a fork of this project, which uses the same hiking function, a slope limit and a steep-street layer. The code here was written independently for this project's data format.
 
 ## Limits
 
